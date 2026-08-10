@@ -1,0 +1,41 @@
+# Status / TODO scratch — 2026-08-10
+
+(Superseded the earlier Round-7 terminal-capture content, which has already been folded into
+GRILLING_LOG.md Round 7. This file is now just a running status note, not a source of truth —
+see CLAUDE.md § notes/ rule: nothing here may be cited as justification for anything.)
+
+## Where we are
+
+- Document set is in place: `CLAUDE.md` (complete), `BACKLOG.md` (populated),
+  `GRILLING_LOG.md` (through Round 9, 2026-08-10), `notes/` (README.md +
+  concurrency-control.md, early), `legacy/` (old StateFlow docs, marked VOID).
+- `SPEC.md` is a **skeleton only** — 19 section headings + one sentence each, no content filled
+  in yet. Per R9-f this is deliberate: skeleton first, owner reviews architecture, then content
+  is filled in, then an external review pass, then development starts.
+- Git repo initialized at this path, but **zero commits** — everything untracked.
+- Go is not installed on this machine; `go.mod` deliberately not written (no guessed toolchain
+  version).
+
+## Open items flagged directly in SPEC.md skeleton
+
+- §10.5: whether `GET /runs/{run_id}/dlq` is the right shape, or whether DLQ history belongs
+  inside `GET /runs/{run_id}`. Not previously discussed.
+- §18 Milestones: only ζ, θ, ε, η, ι are explicitly fixed in order (R5-f). α (basic happy path),
+  γ (retries/DLQ), β (crash recovery), δ (replay) are reconstructed from R1-7 and R3-11 and need
+  owner confirmation.
+
+## Immediate next steps (in progress, 2026-08-10)
+
+1. First commit of the current file set (BACKLOG.md, CLAUDE.md, GRILLING_LOG.md, SPEC.md,
+   legacy/, notes/, this file) — blocked on:
+   - owner setting local git identity (`git config user.name` / `user.email`) — was empty both
+     locally and globally
+   - owner creating an empty GitHub repo by hand and handing back the remote URL (no `gh` CLI
+     installed on this machine, so it can't be created from here)
+2. Push to that remote once (1) is done.
+3. After that: owner reviews the SPEC.md skeleton structure and rules on the two ⚠ open items
+   above, then content gets filled into SPEC.md section by section, sourced only from
+   GRILLING_LOG.md rulings (never invented, never edited into SPEC unilaterally — CLAUDE.md
+   hard rule 1).
+4. Only after SPEC content + external review pass: install Go, write `go.mod` with a real
+   toolchain version, start milestone α.
