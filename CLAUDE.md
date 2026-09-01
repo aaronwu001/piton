@@ -117,6 +117,22 @@ Storage-independent logic may be tested without a database, but it is the minori
 
 Continuously, and always before the owner is asked to look at a milestone by hand.
 
+### 5.5 Test environment lifecycle
+
+`SPEC.md § 4.4` defines the environment (one `docker-compose.yml` plus one hand-run demo script per
+milestone directory). This section defines how the automated suite is run against it.
+
+1. **Group by test file / scenario.** One docker-compose environment is brought up per test file (or
+   per milestone scenario). Every test in that group runs against it. It is then torn down —
+   **including a volume wipe** — before the next group starts.
+2. **Groups never share a live environment.** A group starts from a clean database, always.
+3. **Concurrency and fencing tests form their own group** and are never interleaved with unrelated
+   tests. They manipulate global coordination state (`runs.owner_id`, `orchestrators`), so a test
+   running beside them would see a database that no single test put into that condition.
+4. **Automated tests reference the milestone's own compose file**, never a private one.
+   The owner's manual demo run and the suite must run against an identical environment definition —
+   otherwise a green suite proves nothing about what he saw by hand (§4 step 5).
+
 ---
 
 ## 6. Observability is a requirement, not a nicety
@@ -145,11 +161,31 @@ otherwise, treat them under the same rule as `~/Projects/StateFlow`.
 Go, Postgres, Docker Compose, `golang-migrate`. This was never a source of the old project's
 problems and is not being revisited.
 
-⚠ **Go is not currently installed on this machine.** It must be installed, and `go.mod` written with
-a real toolchain version, before development starts. `go.mod` has deliberately not been created with
-a guessed version.
-
 Module path: `github.com/aaronwu001/piton`.
+
+**Installed on this machine, 2026-09-01** (inside WSL Ubuntu 26.04, per the rule below):
+
+| Tool | Version | Where |
+|---|---|---|
+| Go | 1.27.0 | `/usr/local/go`, on `PATH` via `/etc/profile.d/go.sh` |
+| Docker Engine | 29.7.2 | native `apt` install, `/usr/bin/docker` — **not** Docker Desktop |
+| Docker Compose | v5.5.0 | `docker compose` plugin |
+
+`go.mod` declares `go 1.27.0` — a real toolchain version, never a guessed one. Docker runs under
+systemd (`systemctl is-enabled docker`), so it starts with the distro and needs nothing launched by
+hand on the Windows side.
+
+**Everything executes inside WSL** — the Go toolchain, `docker compose`, `golang-migrate`, `psql`
+and the test suite. The Windows side is an editor only. Never run a build, a container or a
+migration through the Windows-side shell against the UNC path.
+**Why this lives here and not in `SPEC.md`:** it is a fact about this machine, not a rule about the
+system's behaviour. A conforming Piton does not care what OS built it.
+
+**Everything executes inside WSL** — the Go toolchain, `docker compose`, `golang-migrate`, `psql`
+and the test suite. The Windows side is an editor only. Never run a build, a container or a
+migration through the Windows-side shell against the UNC path.
+**Why this lives here and not in `SPEC.md`:** it is a fact about this machine, not a rule about the
+system's behaviour. A conforming Piton does not care what OS built it.
 
 ---
 

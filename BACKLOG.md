@@ -19,12 +19,15 @@ as one would quietly promise they get built.
 | B5 | **Exponential backoff** on the retry delay | Competes with B4 for the same slot; decide them together |
 | B6 | **Named worker registry** | Very low priority |
 | B7 | **`GET /ui`** | Not cut, only deprioritised — terminal-first is the requirement, not terminal-only. May still be useful for demos |
+| B15 | **`max_steps` — a ceiling on how many steps one run may accumulate** | A planner that answers `continue` forever produces a run that never terminates, and no existing budget catches it: budgets count failures, and such a planner is not failing. `SPEC.md § 19.2` publishes the unbounded length as a non-guarantee. An optional configuration field with a default of "no limit" breaks no existing workflow and touches no state machine, so by the §3 admission test it waits |
 
 ## Tuning and housekeeping
 
 | # | Item | Notes |
 |---|---|---|
 | B8 | **Make the planner history cap configurable** | The cap is fixed at the most recent 100 steps. Making the number a setting is the backlog item; the cap itself ships in core |
+| B16 | **Make the `error_text` truncation limit configurable** | Fixed at 4 KB in `SPEC.md § 6.4`, applied to `attempts.error_text` and `dead_letter_queue.error_text` alike. A user who wants longer diagnostics should eventually be able to raise it. Same shape as B8: the limit ships in core, the knob is the backlog item |
+| B17 | **Make the sweep interval configurable** | Fixed at 5 s in `SPEC.md § 8.6`. It is already a value in the orchestrator's configuration file (§4.4); this item is about exposing it as a per-deployment setting with a documented range, since it trades failover latency against query rate |
 | B9 | **`orchestrators` dead-row cleanup** | Rows accumulate because `orchestrator_id` is a fresh UUID per process boot. Not a correctness or performance problem — the table is only ever hit by primary-key point lookups — so it is pure disk housekeeping. `DELETE FROM orchestrators WHERE last_seen_at < now() - interval '7 days'`, with no ordering requirement now that there is no foreign key |
 | B10 | **Retention / purge for terminal runs** | Not required for sweep correctness: with a partial index on running runs, terminal history costs nothing to skip. Worth offering eventually for disk usage only — never as something a user must do to keep the system healthy |
 

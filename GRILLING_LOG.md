@@ -917,4 +917,369 @@ the burden of proof on inclusion.
 |---|---|
 | S-4 | Documents must be written so that a newcomer can use them as reference material and understand them: complete architecture, clear narration, English throughout |
 
+---
 
+## Round 10 — Rulings (2026-08-22)
+
+Context: the previous session's live context was lost. This round begins with Claude reconstructing
+current document state from this log alone (per the standing rule that GRILLING_LOG, not memory, is
+authoritative) and reading it back to the owner. The owner then asked that remaining open items be
+converted into discrete, one-at-a-time decisions rather than open-ended discussion — the format this
+round and Round 11 adopt.
+
+| # | Topic | Ruling |
+|---|---|---|
+| R10-a | SPEC.md 19-section skeleton | **Approved as-is.** Content is now filled in section by section; each section is presented for explicit owner approval before the next is started (CLAUDE.md hard rule 1) |
+| R10-b | §10.5 — `GET /runs/{run_id}/dlq` shape | **Kept as its own endpoint**, not merged into `GET /runs/{run_id}`. DLQ history can accumulate across replay rounds; a separate endpoint keeps the base run read cheap and fetches DLQ detail only when wanted |
+| R10-c | §18 — Milestone α/β/γ/δ content and order | **Confirmed as reconstructed.** α = happy path (static planner, sync envelope worker, run reaches DONE); γ = retries/DLQ (kill a worker, watch attempts burn, land in DLQ); β = crash recovery (kill the orchestrator mid-run, resume; DLQ content untouched); δ = replay in its variants. Discharges the ⚠ in SPEC.md §18 |
+| R10-d | "External review pass" (R9-f, previously undefined) | **Resolved: it means the owner personally re-reading the complete filled-in SPEC end to end, after every section has already been individually approved — not a separate reviewer, tool, or process** |
+
+---
+
+## Round 11 — Rulings (2026-08-22)
+
+Context: continuation of Round 10's one-question-at-a-time format, covering deployment and test
+infrastructure — a topic with **zero prior discussion anywhere in this log** before this round.
+Raised by the owner: orchestrator and database each run in their own container; the database choice
+(Postgres today) is itself a config-file value, in support of the storage abstraction layer already
+ratified in R7-b; demo scenarios need a config file plus a run script usable by hand from a terminal;
+automated tests need a managed lifecycle around that same config.
+
+| # | Topic | Ruling |
+|---|---|---|
+| R11-a | Automated test environment lifecycle | **Grouped by test file / scenario.** One docker-compose environment is brought up per test file (or per milestone scenario), every test in that file/group runs against it, then it is torn down (including a volume wipe, so the next group starts clean) before the next file/group starts. Groups never share a live environment with each other. Concurrency/fencing tests — which manipulate global coordination state (`runs.owner_id`, `orchestrators`) — form their own group and are never interleaved with unrelated tests |
+| R11-b | Where this content lives | **Split by voice, following the existing document separation.** Deployment shape and config-file structure — orchestrator/DB container topology, the config file that declares the storage backend, one docker-compose definition per milestone/scenario — is **system architecture and belongs in `SPEC.md`**, extending §4.4. How automated tests are run against that shape — the grouped-lifecycle rule of R11-a, test scripts, teardown discipline — is **development methodology and belongs in `CLAUDE.md`**, extending §5 (Testing discipline) |
+| R11-c | Demo/test config-file organization | **Adopted.** One directory per milestone/scenario, holding one `docker-compose.yml` plus one hand-run demo script; automated test scripts reference that same compose file rather than each defining their own environment. The owner's manual demo run and the automated suite run against the identical environment definition |
+| R11-d | Timing | **Decide the big-picture architecture now** — container split, config-file organization principle, the test-lifecycle grouping rule — as part of the ongoing section-by-section SPEC/CLAUDE.md fill. **Defer specifics** — exact services/images per milestone, any future Kubernetes manifests, per-scenario detail — to when Milestone α implementation actually starts |
+
+---
+
+## Round 12 — Rulings (2026-08-22)
+
+Context: the owner reframed the immediate goal — **reach a demoable alpha quickly**, filling in only
+what the alpha needs, *except* that any architecture later features depend on must still be settled
+and built now. Claude analysed the skeleton against this log and found that the §3 admission test
+("would adding this later be awkward?") admits nearly every section: definitions, the state table,
+the schema, the wire formats and the concurrency rules are all either load-bearing for α or
+contracts other people build against. Only per-milestone demo detail failed the test. The owner
+therefore chose to have the whole SPEC filled in at once and reviewed in a single pass.
+
+| # | Topic | Ruling |
+|---|---|---|
+| R12-a | **Section-by-section approval (R10-a) is overruled** | SPEC is filled in **completely in one pass** and reviewed by the owner in one sitting. Reason given: speed toward a demoable alpha. R10-a's protection is not abandoned — the owner may still reject any individual section and have it redone in isolation; what is dropped is the requirement to approve each section *before the next is written* |
+| R12-b | `step_max_attempts` / `planner_max_attempts` edge case (the open question left by R7-e) | **A value below 1 is rejected at submission time with a 400.** This is the G2 principle (R4-10) applied to configuration: it removes the need to define what "zero attempts" would mean, because a step that is created but never executed has no useful semantics. → `SPEC.md § 11.1`, `§ 16` |
+| R12-c | Demo scripts for milestones other than α | **Only α's demo script is written now.** The other eight keep the R5-f order table plus a one-line capability statement. Reason: a demo script is an operational verification artefact, not an architectural commitment — writing the later ones now would mean inventing detail that no ruling covers, and CLAUDE.md §4 already places the demo script at the start of each milestone's own work |
+| R12-d | Scope of the fill | Every section of the 19-section skeleton is filled from rulings already in this log. Where this log was **silent** and α or the schema needed an answer, Claude made the minimal inference, marked it **⚠ in place**, and collected all of them in `SPEC.md § 19.1` as O1–O8 for an explicit ruling. **These eight are the only places where SPEC contains something this log did not decide** |
+| R12-e | R11-a transcribed into CLAUDE.md | Per R11-b's ruling that test-lifecycle discipline belongs in `CLAUDE.md § 5`, R11-a is written there as **§ 5.5 Test environment lifecycle**. `SPEC.md § 4.4` carries the environment *shape*; CLAUDE.md carries how the suite is run against it |
+
+### Derivations worth recording (why certain columns exist the way they do)
+
+These were not separate rulings; they fell out of existing ones while writing §6, and are recorded
+so they are not re-litigated:
+
+| Finding | Consequence |
+|---|---|
+| A cancelled attempt does not burn budget (R5-5's uniform cancel rule), so `steps.attempt_count` and `COUNT(attempts)` legitimately differ | `attempt_count` **must** be a stored column, not a derived count. Deriving it would make cancellation silently consume budget |
+| The R7-d exception permits a non-owner callback to write **only** the `attempts` table | `attempts.output` **must** exist. A successful async callback landing on a non-owner needs somewhere to deposit the result; the owner promotes it to `steps.output` on its next poll |
+| The R4-11 claim-time refinement (expire a sync attempt immediately, let an async attempt run to its deadline) is evaluated by a *new* owner | `connection_mode` **must** be persisted on the attempt row, not only inside `steps.decision` |
+| The callback endpoint is addressed by `attempt_id` alone | `attempts.run_id` is denormalised so the handler locates the run without a join |
+
+---
+
+## Round 13 — Rulings (2026-08-22)
+
+Context: the owner directed a read of `~/Projects/StateFlow` — the old project's **complete
+implementation** (one migration, ~10 Go files under `internal/{core,planner,orchestrator,transport,store,api}`)
+— to test the inferences Round 12 had marked ⚠, and specifically the areas Claude had flagged as
+needing careful review: O1–O8, the §6 column lists, and §4.2's commit ordering.
+
+**Method, and the rule that governed it (CLAUDE.md §7).** The old code was read as *evidence that a
+shape is implementable*, never as *a reason Piton behaves a certain way*. Nothing below is in SPEC
+because StateFlow did it. Where the two agree, the agreement is recorded as independent convergence;
+where SPEC gained something, the justification is stated in Piton's own terms and the old code
+appears only as the illustration of what goes wrong without it.
+
+### Independent convergence — inferences that survived, unchanged
+
+The old implementation, under different design pressure and with no lease, no persisted deadline and
+no cancellation, nevertheless arrived at the same shape in these places. **No SPEC change.**
+
+| SPEC | What the old implementation does |
+|---|---|
+| §4.2 — the attempt row commits **before** the outbound HTTP call | Identical, and deliberate there too: `loop.go:286-295` labels it "Barrier 1 (TX1): persist decision + first attempt BEFORE dispatch"; TX1 commits at `postgres.go:173` and only then does `loop.go:356` dispatch. The retry and replay paths keep the same order |
+| §11.1 — `step_max_attempts` is a **total** count | `postgres.go:306-318`: counter starts at 0, +1 per failure, `>= retryLimit` ⇒ DLQ. So limit 1 = one dispatch, no retry. **Their own USER_MANUAL.md:236 documented it as `(X+1)`, contradicting their code** — a direct instance of the confusion R7-e demanded SPEC state loudly |
+| O1 — static plan as an ordered array inside the workflow row | `planner/static.go`: steps live in the workflow's config JSON; `Decide` indexes by the count of completed steps; past the end it answers `done`. No separate table, no file on disk |
+| O7 — retry delay is in-memory and not preserved across a crash | `loop.go:419-429` uses `time.After`; there is no column. After a restart they skip the wait entirely, reasoning that "the crash itself already provided more than enough cooldown" |
+| O2 — a distinct "reply could not be parsed" failure class is needed | They call it `malformed`, one of four CHECK-constrained values |
+| §6.3 — `attempt_count` stored on the step, not counted from `attempts` | Same column, incremented in the failure transaction |
+| §14 — replay resets `attempt_count` to 0 | Same |
+| §12.1 — a planner `fail` verdict consumes no budget | Same |
+
+### Rulings
+
+| # | Topic | Ruling |
+|---|---|---|
+| R13-a | O3 — the planner budget column | **Promoted from inference to a specified rule** (§6.2). The old design's planner budget is a loop counter in memory that resets on restart, so a crash loop against a broken planner **never converges to DLQ**. SPEC §12.2 asserts unbounded retry is structurally impossible; that assertion is only true because this counter is persisted. It is §1 applied to a budget, not a preference. **O3 is discharged** |
+| R13-b | `runs.updated_at` / `steps.updated_at` | **Both deleted.** A column that every business transaction must remember to write is the same failure mode §8.2 rejects for the ownership predicate — one forgotten transaction and it silently lies. The old schema proves it is not hypothetical: their step-creation and step-success transactions never touch the `runs` row, so `runs.updated_at` does not advance while a run makes progress. `created_at`, `steps.completed_at`, `attempts.started_at`/`finished_at` and `dead_letter_queue.created_at` each record one specific event and cannot drift |
+| R13-c | Dead-letter granularity | **`kind ∈ {worker, planner}` replaced by a five-value `reason`**: `worker_budget_exhausted`, `planner_unreachable`, `planner_invalid_response`, `planner_budget_exhausted`, `planner_declared_fail`. The three planner causes demand three different responses from the operator — fix the network, fix the planner, accept its judgement — and free text cannot be filtered. Admitted now rather than later because `dead_letter_queue` is append-only: a column added after the fact is permanently blank for exactly the history that mattered. `step_id IS NULL` still distinguishes the two sides, so no second column |
+| R13-d | Unbounded run length | **Published as a non-guarantee in §19.2, not fixed.** A planner that answers `continue` forever is never caught by any budget, because the budget counts failures and it is not failing. A `max_steps` limit is an optional config field, so by the §3 admission test it goes to BACKLOG; what would be costly is discovering the property later and reading it as a defect |
+| R13-e | `status` ↔ `failure_reason` | **Made a backend-enforced invariant on `attempts`** (§6.4): FAILED ⇒ reason present, not-FAILED ⇒ reason absent, plus `finished_at` present iff not RUNNING. §17 promises the database explains itself; a FAILED row with no reason breaks that promise, and a reason on a DONE row is a contradiction a later reader will believe |
+| R13-f | Completion signal | **§6.3 now states that completion is `status = 'DONE'` and nothing else** — no rule or query may read "output is present" as "the step finished". A worker may legitimately return the JSON document `null`, and a backend may encode that indistinguishably from absent. The old schema documented output-nullness *as* its completion test while its own writer substituted a JSON `null` for an empty value |
+| R13-g | `timeout` vs `transport_error` | **Definition tightened in §5.3: the clock decides, not the error's shape.** `timeout` means `deadline_at` has passed; anything before that is `transport_error`. The old loop classified every dispatch error — connection refused included — as `timeout`, because under a deadline-bearing context both surface as one error from one call. The operator then misreads a dead worker as a slow one, and the two point at different fixes |
+| R13-h | `attempts.dispatch_style` | **Removed.** §8.6's claim-time rule branches on `connection_mode` and must do so in SQL before any decision document is parsed, so that column stays. Nothing branches on `dispatch_style` outside dispatching, where `steps.decision` has necessarily already been read |
+| R13-i | Static planner steps | **Each element of `planner_static_steps` is a StepSpec and is validated as one, by §9.4 and §9.8, at `POST /workflows`** (§6.1). One type, one validator; a static step carrying `timeout_seconds` is a 400 until η exactly as from an HTTP planner. **§12.1 additionally states that the static planner needs no exemption from the budget rules** — it cannot fail at run time once its steps are validated at submission, so no special case should be written. The old project had both defects this closes: a reduced four-field static step form with unknown keys silently dropped, and a hard-coded branch skipping the planner budget for static planners. Their consequence was that an invalid static plan produced a run stuck `RUNNING` forever, reclaimed and re-failed by every sweep. **O8 is discharged** |
+| R13-j | Milestone α's endpoint scope | **§18.1 now names the five endpoints α implements.** §10.2's full read surface stays in SPEC as a contract (R9-b′), but α's planner is in-process and fetches nothing, so the remaining read endpoints land with ζ — the first milestone with a planner able to call them |
+
+### Divergences confirmed as intended — recorded so they are not re-opened
+
+Each of these is a place where Piton deliberately differs, and seeing the old code made the cost of
+the old choice concrete:
+
+| Piton | Old implementation | Consequence there |
+|---|---|---|
+| `attempts.deadline_at` (R4-a) | No column; a Go-local `time.Now()` plus a context deadline, explicitly "never persisted" | The timer dies with the process; `orphaned` had to become a real recovery mechanism rather than a label |
+| Lease + `orchestrators` table (R7-a) | An in-process `map[RunID]struct{}`, self-described as not needing to survive a restart | Single replica by construction |
+| Async result delivered through a row (R7-d) | An in-memory channel registry keyed by **step id**, self-described as: after a restart, recovery re-dispatches rather than reconnecting | **Async work already completed is discarded on crash.** This is what §8.4's `attempts.output` exists to prevent |
+| `runs.replay_count` (R5-d) | Absent; the round is inferred from the newest dead-letter row's timestamp | Exactly the reconstruct-by-timestamp approach R5-4 rejected |
+| UUID identity, optional `step_name` (R2-6) | `step_id` is literally `"{run_id}:{step_name}"`, name NOT NULL | Two steps sharing a name collide on the primary key; the async handler recovers a run id by string-splitting a step id |
+| `steps(run_id, seq)` **unique** (§7.2) | No unique constraint, only a non-unique composite index | Uniqueness rests entirely on "one goroutine per run" — untrue the moment a second replica exists |
+| Symmetric `step_*` / `planner_*` knobs (R7-e) | Three competing retry settings, one of which is dead code whose computed verdict is discarded at the call site | The "you cannot tell what governs what" failure R7-e was reacting to |
+| `output_field` cut (R7-g) | Present, sync-only, top-level key lookup | — |
+
+---
+
+## Round 14 — Rulings (2026-08-24)
+
+Context: Claude listed the remaining ⚠ inferences as discrete questions. The owner ruled on five and
+sent three back as not clearly enough posed (the static-planner definition, retry-delay persistence,
+and what `overrides` was for). Those three are carried into Round 15.
+
+| # | Topic | Ruling |
+|---|---|---|
+| R14-a | `invalid_response` (was O2) | **Kept as its own `failure_reason`.** The three values name three different repairs — the worker's business logic, its output format, the network — and the operator chooses his next move from this column. Adding an enumerated value later would leave every earlier attempt mis-classified. **O2 discharged.** The name `invalid_response` over the old project's `malformed` was not separately ruled; Claude kept the more self-describing one |
+| R14-b | `error_text` truncation (was O4) | **4 KB**, and **recorded as a future client-adjustable setting** → `BACKLOG.md` B16. Interpretation Claude applied where the ruling was silent: **one limit covers both `attempts.error_text` and `dead_letter_queue.error_text`**, and truncation is the orchestrator's job, never the backend's. **O4 discharged** |
+| R14-c | Unknown top-level key in a StepSpec (was O5) | **A planner failure.** Owner's reasoning: the planner did not write the fields the orchestrator expects. The forward-compatibility cost was stated in the question and accepted — a planner that adds a field of its own breaks against an orchestrator that has not learned it yet, with no escape hatch. **O5 discharged** |
+| R14-d | Error response body (was O6) | **Carries both entities: `run_id` + `run_status` **and** `step_id` + `step_status`.** Owner: "we would rather record more." Interpretation Claude applied: a rejection carries the identifier and status of every entity the request named or would have touched, **omitting only those that do not exist** — a `POST /workflows` rejection has no run to describe. `error` is a stable machine-readable slug, `message` is human-readable and may change. **O6 discharged** |
+| R14-e | Sweep interval | **5 seconds**, and **recorded as a future client-adjustable setting** → `BACKLOG.md` B17. It is the width of §13.3's uncertainty window, so it is chosen to be negligible against any realistic `step_timeout_seconds` |
+
+### Carried into Round 15
+
+| # | Question | Why it was returned |
+|---|---|---|
+| R14-Q1 | The static planner's definition (O1) | The question was posed as a storage-layout choice without first stating what a static planner *is* and how it contrasts with the HTTP one. Re-asked with the model stated and the specific gaps named |
+| R14-Q2 | Retry-delay persistence (O7) | The question did not make clear that the two options differ **only** when the orchestrator crashes mid-delay. Re-asked as a timeline |
+| R14-Q3 | Whether `runs.overrides` needs a column now | The owner did not recall what `overrides` was for. It is R2-9 / R7-f's config layering; re-asked with that context restored |
+
+---
+
+## Round 15 — Rulings (2026-08-24)
+
+| # | Topic | Ruling |
+|---|---|---|
+| R15-a | Retry-delay persistence (was O7, R14-Q2) | **Not persisted.** The delay lives in the driver's memory; a crash discards its remainder and the next owner dispatches immediately. Owner's reasoning: *"we do not need to guarantee too much right now — only that the core functions work."* The cost is written into §11.1 rather than hidden: a delay that existed because a worker was rate-limiting disappears exactly when the worker can least afford it. The remedy is named there too — a nullable `steps.next_attempt_at` where `NULL` means "dispatchable now", addable later with no backfill and no change of meaning. **O7 discharged, and §19.1 now holds only O1** |
+| R15-b | `runs.overrides` column (R14-Q3) | **No column until η.** The API field stays exactly as R7-f ruled — `overrides` is accepted in the run-creation body and any non-empty value is a 400 — because a request shape is a contract others build against. The *column* is invisible to every caller, can hold nothing before η by construction, and is a nullable addition whenever wanted; creating it now would only show an operator a permanently empty column. **This reverses Claude's earlier inference**, which had leaned on R2-8c; that ruling's reasoning was that an early milestone should demo with `retry_limit = 0` rather than a missing field — i.e. the *field* keeps demos consistent — and `overrides` has no demo to be consistent with |
+
+Note on where R15-b was recorded: run-level overrides are **scheduled work** (milestone η), so the
+statement lives in `SPEC.md § 11.2`, not in `BACKLOG.md`. `BACKLOG.md` is for unscheduled items;
+putting a milestone's content there would invert the separation R5-e established. This differs from
+R14-b and R14-e, whose "make it configurable later" halves went to BACKLOG precisely because they
+are not scheduled.
+
+
+
+---
+
+## Round 16 — Claude's analysis (input; not itself spec)
+
+Context: the owner asked (a) where the project stands, (b) what the next step is, and (c) whether
+his intended working loop — *"focus on one unit at a time; Claude writes tests from SPEC; owner
+reviews the tests; Claude implements to meet them; owner reviews the implementation; then deploy and
+run the demo"* — matches the flow already agreed in `CLAUDE.md § 4`. No ruling was issued; this
+entry records the assessment put to him.
+
+### R16-1 · State of the repository
+
+| Thing | State |
+|---|---|
+| `SPEC.md` | Fully written, §0–§19 + Appendix A. Exactly **one** ⚠ remains: `planner_static_steps` / the static-planner definition (§6.1, §19.1 O1) |
+| `GRILLING_LOG.md` | Through Round 15 (2026-08-24) |
+| `BACKLOG.md` | Populated, B1–B17 |
+| Code | **None.** No `go.mod`, no `demos/`, no migrations. Go is not installed |
+| Git | One commit (the skeleton). All four documents, including the fully-written SPEC, are uncommitted |
+| `temp` | Stale — dated 2026-08-10, still describes SPEC as a skeleton. Not an authority (§1 `notes/` rule) and should be deleted or rewritten |
+
+### R16-2 · What blocks milestone α under `CLAUDE.md § 4` step 1
+
+1. **O1 is the static planner**, which is α's planner. §4 step 1 forbids starting a milestone whose
+   SPEC dependency is unratified. §6.1 already carries a written-out inferred definition; the owner
+   need only confirm or amend it.
+2. **Toolchain.** `CLAUDE.md § 8` requires Go installed and `go.mod` written with a real version.
+   Unresolved alongside it: the working tree is a WSL path reached over UNC while the shell is
+   Windows-side, so where Go, Docker and `golang-migrate` actually execute has to be settled once.
+3. The documents are uncommitted.
+
+### R16-3 · The owner's loop measured against `CLAUDE.md § 4`
+
+**Matches:** tests derived from SPEC before the implementation exists, and the owner reviewing those
+tests before implementation starts, are §4 steps 3–4 and §5.1 exactly. The ordering is what stops
+the §5.1 table's third row — a test written by reading the code — from ever occurring.
+
+**Three divergences named:**
+
+| # | Divergence | Rule it meets |
+|---|---|---|
+| a | **"Unit."** §4's unit of work is a *milestone — a demo scenario*, deliberately not a layer. If "unit" means storage layer, then driver, then HTTP, the checkpoint becomes "the storage tests are green", which §4 step 5 says is not evidence a milestone landed. Slicing work inside α is fine; slicing the *checkpoint* is not | §4 |
+| b | **The demo script comes before the tests**, not after. α's script exists as prose in §18.1, but `demos/alpha/` — `docker-compose.yml`, `piton.yaml`, `workflow.json`, `demo.sh` — does not exist, and §5.5.4 requires the automated suite to reference that same compose file. The environment is therefore a *precondition* of writing tests, not a deployment step that follows them | §4 step 2, §4.4, §5.5.4 |
+| c | **"Owner reviews the implementation, then deploy"** omits §4 step 5: the owner **runs the demo by hand and inspects database truth from a terminal**. Neither a code review nor a green suite substitutes for it. The demo is the acceptance gate, not the victory lap | §4 step 5, §6 |
+
+### R16-4 · Review granularity — the recommendation put to the owner
+
+A full write-tests → review → implement → review cycle per code unit would cost four or five
+separate owner reviews across α, and α's tests are dominated by storage and concurrency cases that
+are mutually entangled, so each review would rebuild context already built. The recommendation was
+**one review of α's whole derived test list**, then batched implementation, with the §5.5 test
+groups (schema/CRUD; claiming-fence-CAS-sweep in isolation; validation; end-to-end) as the fallback
+seams if the owner wants tighter control. Awaiting his decision.
+
+## Round 16 — Rulings (2026-09-01)
+
+| # | Topic | Ruling |
+|---|---|---|
+| R16-a | Where Go, Docker and the toolchain run | **Inside WSL.** The Windows side is an editor only. The owner further ruled that **this does not belong in `SPEC.md`** — it is a fact about this machine, not behaviour of the system — so it was recorded in `CLAUDE.md § 8` instead. A conforming Piton does not care what OS built it |
+
+Carried: O1 was re-put to the owner in plain terms (what "ratified", "O1" and "ruling" each mean in
+this project's vocabulary), with §6.1's inferred static-planner definition quoted verbatim for a
+yes/amend answer. Not yet ruled.
+
+---
+
+## Round 17 — Claude's analysis (input to SPEC; not itself spec)
+
+Context: the owner ruled that **the HTTP planner is built first and the static planner is deferred**,
+and asked for the trade-off between declaring the planner-kind discriminator now versus adding it
+later. No SPEC edit has been made; three questions were put back to him.
+
+### R17-1 · The field already exists
+
+`planner_type` is already in `SPEC.md § 6.1` and already in §16's submission-time validation list.
+The owner's instinct matched what was written, so "design it now vs later" carries no change cost
+here. The live questions are narrower: what the value is called, what `static` returns today, and
+which columns are created now.
+
+### R17-2 · Why declaring it now is right anyway (the analysis he asked for)
+
+| | Declare now, accept one value | Add the field later |
+|---|---|---|
+| §3 admission test | **Yes — awkward later.** It is a discriminator in a request body that operators and their scripts build against | Adding a required discriminator to a published request shape is a breaking change |
+| Validation posture | §16 is a whitelist from day one: an unknown `planner_type` is a 400, including the typo `"htp"` | Day-one orchestrator is silent about planner kind; when `static` arrives, an existing workflow's kind must be *inferred* (has `planner_url`, therefore http) — inferred state where declared state was available |
+| Cost | An enum with one legal value reads as unfinished, and one dead rejection branch is carried for a few milestones. A default (`http` when omitted) removes the ergonomic cost | — |
+
+**Precedent it follows:** R15-b's `overrides` — the API field ships now and an illegal value is a
+400, while the *column* waits. The same split applies here with one refinement: `planner_type` and
+`planner_url` need real columns immediately because the HTTP planner uses them, whereas
+**`planner_static_steps` should not be created until the static milestone** — by R15-b's own
+reasoning, a column that can hold nothing by construction only shows an operator a permanently empty
+column. This also means **O1 stops blocking development**: with static out of α, the static
+planner's definition becomes a question for a later milestone.
+
+### R17-3 · Naming — `http` recommended over `dynamic`
+
+`dynamic` names the behaviour; `http` names the mechanism. Every other enum in this document names
+the mechanism — `connection_mode: sync|async`, `dispatch_style: envelope|raw`. `dynamic` is also
+inaccurate as an opposite of `static`: the static planner is *also* asked once per step; what
+differs is where the answer comes from — a URL, or an array inside the workflow. Recommended, not
+ruled.
+
+### R17-4 · The decision enlarges α, and that must be said plainly
+
+The static planner was first *because* it runs in process, cannot fail, and is fully validated at
+submission. Swapping it out pulls into α: a fourth container for the planner; the M1/M2 wire
+protocol (§9.2, §9.3), which α previously did not touch at all; run-time StepSpec validation (§9.8)
+that submission-time validation had made unnecessary; and the possibility of planner failure, which
+brings `planner_max_attempts`, `runs.planner_attempt_count` and planner-side DLQ (L5) — §12.2 and
+§12.3, previously γ's content.
+
+Two ways to bound it were put to the owner:
+
+- **A — α stays happy-path only.** Planner failure is left to γ. Rejected in the recommendation: a
+  mistyped `planner_url` on day one leaves a run sitting `RUNNING` forever, reclaimed and re-failed
+  by every sweep — precisely the state §6.1's *"Why validation happens at submission"* paragraph
+  exists to make unreachable.
+- **B — α includes the planner budget and planner-side DLQ (L5).** α grows by roughly a third and
+  gains a second demo leg ("point `planner_url` at a dead address, watch the run land in DLQ"); γ
+  is then reduced to the worker-side half. **Recommended.**
+
+### R17-5 · Carried to the owner
+
+1. `http` or `dynamic` as the value name.
+2. Bound α by A or B.
+3. Where the static planner goes in `SPEC.md § 18` — swapped with ζ, moved to the end, or out of the
+   milestone list entirely — and what `planner_type: "static"` returns until then (recommended: 400,
+   `"not yet supported"`).
+
+---
+
+## Round 18 — Rulings (2026-09-01)
+
+| # | Topic | Ruling |
+|---|---|---|
+| R18-a | Planner order | **Reversed back: the static planner stays in milestone α and the HTTP planner stays at ζ**, as `SPEC.md § 18` already has it. The owner had briefly ruled the opposite in Round 17 and withdrew it on recalling why static was first. **Round 17 is superseded in full and left in place** (`CLAUDE.md § 1`: superseded entries are not deleted, and the log is never an authority). Its three carried questions — the `http`/`dynamic` naming, bounding α by A or B, and where static sits — all lapse: SPEC as written already answers them |
+| R18-b | Development starts | **Now.** No SPEC edit results from this round; §6.1, §16, §18.1 stand unchanged |
+
+Note: O1 (§19.1, the static planner's definition) therefore returns to blocking α, exactly as
+R16-2 described. It was re-put to the owner in plain terms at the end of Round 16 and has still not
+been ruled on. The owner then asked, before starting, for a plain-language walkthrough of the data
+model, of where a static step lives inside it, and of whether the static planner is a server or a
+file — which is, in substance, the same question O1 asks. His answer to that walkthrough is expected
+to discharge O1.
+
+---
+
+## Round 19 — Rulings (2026-09-01)
+
+| # | Topic | Ruling |
+|---|---|---|
+| R19-a | **O1 — the static planner's definition** | **Ratified.** Put to the owner in plain language: `planner_static_steps` is an ordered array of StepSpecs living on the `workflows` row; a `steps` row is what one of those elements produces when executed, and `steps.decision` stores that element verbatim; the planner itself is **neither a server nor a file** — it is a function inside the orchestrator process that returns `planner_static_steps[n]` for `n` = the run's current step count, `done` at the end, never `fail`; `workflow.json` is only the transport for the operator's `curl`. Owner: *"這樣沒錯."* **O1 discharged — §19.1 is now empty, and no unratified inference remains anywhere in SPEC** |
+| R19-b | Transcription | On that ruling, `SPEC.md § 6.1` lost its ⚠ marker and §19.1 was rewritten to record that nothing is outstanding. **No behavioural text changed** — the definition ratified is the one that was already written |
+
+### Machine setup performed (not spec; recorded because `CLAUDE.md § 8` flagged it as a blocker)
+
+- **Go 1.27.0** (released 2026-08-18) installed to `/usr/local/go` inside WSL Ubuntu 26.04.
+  SHA-256 `675c26c4…0685` verified against `go.dev/dl`'s published value. `PATH` extended via
+  `/etc/profile.d/go.sh`.
+- **Docker is not usable yet.** Docker Desktop is installed on the Windows side but is not running,
+  and WSL integration is not enabled for this distro, so no `docker` binary exists inside Ubuntu.
+  This blocks everything in `CLAUDE.md § 5.3` — every ownership, claiming, fencing, CAS and sweep
+  test must run against a real Postgres from `docker compose`. Put to the owner as a choice between
+  enabling Docker Desktop's WSL integration and installing Docker Engine natively inside WSL.
+
+## Round 19 — Environment established (2026-09-01)
+
+| # | Topic | Ruling / outcome |
+|---|---|---|
+| R19-c | Docker | **Docker Engine installed natively inside WSL**, not Docker Desktop's WSL integration. Options put to the owner were (a) native `apt` install of `docker-ce`, (b) ticking WSL integration in Docker Desktop. He chose (a). Reasoning offered and accepted: the demo and the suite then depend on nothing outside the distro, which is what `CLAUDE.md § 8`'s "everything executes inside WSL" already commits to, and it removes a step that can be forgotten before every session. Cost stated: two `docker` binaries exist on `PATH`, the native one winning |
+
+**Installed and verified:** Go 1.27.0 (`/usr/local/go`, SHA-256 verified against `go.dev/dl`);
+Docker Engine 29.7.2 and Compose v5.5.0 from Docker's own apt repository, under systemd so it starts
+with the distro; `aaronwu` added to the `docker` group. `CLAUDE.md § 8`'s ⚠ is discharged and the
+section now records what is installed.
+
+**Toolchain proven end to end, not merely installed:**
+
+- `go mod init github.com/aaronwu001/piton` → `go.mod` declaring `go 1.27.0`, a real version.
+- `cmd/piton/main.go` — a placeholder entry point — passes `go vet ./...`, builds and runs.
+- A throwaway `docker compose` environment brought PostgreSQL 18.6 up to a healthy state, and three
+  things `SPEC.md` depends on were exercised against it rather than assumed:
+  - a **partial index** (`CREATE INDEX … WHERE status = 'RUNNING'`) — §7.2's sweep index;
+  - `SELECT … FOR UPDATE` — §7.3 obligation 2;
+  - the **CAS primitive** of §8.1: the first `UPDATE … WHERE status='RUNNING' RETURNING` returned
+    one row, the second returned `UPDATE 0` and zero rows. *"Zero rows affected means the
+    expectation was wrong, and is not an error condition — it is the answer."* Confirmed on the real
+    engine.
+- Environment then torn down with `docker compose down -v`, the volume wipe `CLAUDE.md § 5.5`
+  requires between groups.
+
+Not done, deliberately: `demos/alpha/` and the migrations. They are the next step, and the compose
+file used above was a throwaway precisely so that `demos/alpha/docker-compose.yml` is written once,
+as the real one the suite will reference (§5.5.4). Nothing has been committed — the four modified
+documents plus `go.mod`, `.gitignore` and `cmd/` are all still in the working tree.
