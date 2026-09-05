@@ -1497,7 +1497,7 @@ shown until DLQ exists.
 system useful to someone else, and everything before it is the engine proving it is trustworthy.
 
 Each milestone section states its demo script: what the operator does by hand, and what he must see
-in the database afterwards. Only α's is written now; the rest are written when that milestone
+in the database afterwards. α's and γ's are written; the rest are written when that milestone
 starts.
 **Why:** a demo script is an operational verification artefact, not an architectural commitment.
 Writing the later ones now would mean inventing detail that no ruling covers.
@@ -1570,6 +1570,75 @@ checks on the same parse. **ι demonstrates validation; it does not introduce it
 
 **What α deliberately does not demonstrate:** retries, DLQ, crash recovery, replay, cancellation,
 raw dispatch, async, an HTTP planner, or any override. Each has its own milestone.
+
+### 18.2 Milestone γ — demo script
+
+**Capability:** an operator watches a step's attempts burn against a failing worker — recovering on
+the last one in one case, and exhausting `step_max_attempts` into the dead-letter queue in three
+others, one for each way a worker can fail.
+
+**Environment** — `demos/gamma/`:
+
+| File | Content |
+|---|---|
+| `docker-compose.yml` | `postgres`, `orchestrator`, and one worker whose behaviour each step selects through its own `params` |
+| `piton.yaml` | As α's |
+| `workflow-retry.json` | Leg 1 — the worker fails twice, then succeeds |
+| `workflow-worker-error.json` | Leg 2 — the worker reports failure in Piton's envelope |
+| `workflow-http-500.json` | Leg 3 — the worker replies non-2xx |
+| `workflow-unreachable.json` | Leg 4 — `worker_url` names a port nothing listens on |
+| `demo.sh` | All four legs against one environment, runnable unattended |
+
+Every leg uses the default `step_max_attempts = 3` (§11.1) and the static planner of α.
+
+**What the operator must see — leg 1, the recovering retry:**
+
+```sql
+SELECT status, attempt_count FROM steps WHERE run_id = :run;
+-- DONE, attempt_count = 3   (§11.1: a total attempt count, not a retry count)
+
+SELECT attempt_no, status, failure_reason FROM attempts
+ WHERE run_id = :run ORDER BY attempt_no;
+-- 1 FAILED, 2 FAILED, 3 DONE
+
+SELECT count(*) FROM dead_letter_queue WHERE run_id = :run;   -- 0
+SELECT status FROM runs WHERE run_id = :run;                  -- DONE
+```
+
+**What he must see — legs 2, 3 and 4, which differ only in `failure_reason`:**
+
+```sql
+SELECT status, owner_id, claimed_at FROM runs WHERE run_id = :run;
+-- DLQ;  owner_id and claimed_at both NULL   (§6.2, §8.7)
+
+SELECT status, attempt_count FROM steps WHERE run_id = :run ORDER BY seq;
+-- the failing step DLQ with attempt_count = 3;  no step created after it
+
+SELECT attempt_no, status, failure_reason FROM attempts
+ WHERE run_id = :run ORDER BY attempt_no;
+-- three rows, all FAILED, all carrying the leg's reason:
+--   leg 2  worker_error       leg 3  transport_error       leg 4  transport_error
+
+SELECT reason, step_id, replay_round, attempt_count FROM dead_letter_queue
+ WHERE run_id = :run;
+-- exactly one row: worker_budget_exhausted, step_id = the failing step,
+-- replay_round = 0, attempt_count = 3   (§6.5, §12.4)
+```
+
+Leg 4 is where §5.3's clock rule is visible: the connection is refused immediately, well inside
+`step_timeout_seconds`, and the attempt is `transport_error` — **not** `timeout`.
+
+`run = RUNNING, last_step = DLQ` is never observable, because §12.2 writes the step, the run and the
+dead-letter entry in one transaction. §5.6 calls that combination impossible; this is the milestone
+that can see it.
+
+**Which endpoints γ implements.** None beyond α's.
+
+**What γ deliberately does not demonstrate:** the planner side of §12.3. The static planner cannot
+fail at run time (§12.1), so the only way to reach L5 today is an unbuilt planner reporting that it
+is unbuilt — which would demonstrate the milestone's absence, not the mechanism. It is demonstrated
+at **ζ**, the first milestone with a planner that can genuinely fail. Also absent: crash recovery
+(β), replay (δ), and everything α already excluded.
 
 ---
 

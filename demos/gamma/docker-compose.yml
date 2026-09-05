@@ -1,0 +1,214 @@
+# Milestone gamma - environment definition.
+#
+# SPEC.md 18.2 names this file and fixes its shape: "postgres, orchestrator,
+# and one worker whose behaviour each step selects through its own params".
+# There is no second worker service and no fourth service of any kind - the
+# unreachable leg is produced by naming a port nothing listens on, not by
+# taking a container away, so that every leg runs against one environment that
+# is never modified mid-demo.
+#
+# It is a near-copy of demos/alpha/docker-compose.yml, deliberately: SPEC.md 4.4
+# gives each milestone its own directory with its own compose file, and
+# CLAUDE.md 5.5.4 requires the automated suite to reference the milestone's own
+# file. Sharing one file between milestones would mean a change made for gamma
+# could silently alter what the owner verified by hand for alpha.
+#
+# Teardown between runs is `docker compose down -v`. The volume wipe is not
+# optional: CLAUDE.md 5.5.2 requires every group to start from a clean database.
+
+name: piton-gamma
+
+services:
+
+  # ---------------------------------------------------------------- postgres
+  postgres:
+    image: postgres:18.6-alpine
+    environment:
+      POSTGRES_USER: piton
+      POSTGRES_PASSWORD: piton
+      POSTGRES_DB: piton
+    volumes:
+      # Postgres 18+ wants ONE mount at /var/lib/postgresql, not at
+      # /var/lib/postgresql/data. See the same note in alpha's compose file.
+      - pgdata:/var/lib/postgresql
+    # No host port is published, for the reason alpha's file gives: a fixed
+    # port collides with any Postgres the operator already runs. SPEC.md 17.1's
+    # access path needs nothing installed on the host:
+    #
+    #   docker compose exec -T postgres psql -U piton -d piton
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U piton -d piton"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+
+  # ------------------------------------------------------------ orchestrator
+  orchestrator:
+    build:
+      context: ../..
+      dockerfile_inline: |
+        FROM golang:1.27-alpine AS build
+        WORKDIR /src
+        COPY . .
+        RUN CGO_ENABLED=0 go build -trimpath -o /out/piton ./cmd/piton
+
+        FROM alpine:3.22
+        COPY --from=build /out/piton /usr/local/bin/piton
+        ENTRYPOINT ["/usr/local/bin/piton"]
+    command: ["--config", "/etc/piton/piton.yaml"]
+    volumes:
+      - ./piton.yaml:/etc/piton/piton.yaml:ro
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # Demo determinism, not an architectural dependency - see alpha's file.
+      # It matters more here than it does there: if the worker were not yet
+      # listening, a leg that expects worker_error would record
+      # transport_error instead, and SPEC.md 18.2 exists precisely to show
+      # that those two are different rows.
+      worker:
+        condition: service_healthy
+    # A 200 from /healthz proves migrations finished: there is no migration
+    # service, so the orchestrator applies them at boot and binds its listener
+    # only afterwards.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8080/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+      start_period: 5s
+
+  # ------------------------------------------------------------------ worker
+  #
+  # The worker SPEC.md 18.2 requires: one service whose behaviour each step
+  # selects through its own params. It speaks sync + envelope, the only
+  # combination legal before theta and epsilon (SPEC.md 9.7).
+  #
+  # params.mode selects one of four behaviours, and each names the SPEC.md 5.3
+  # value the resulting attempt must carry:
+  #
+  #   echo               success. SPEC.md 9.6 sync+envelope success shape
+  #   worker_error       200, but a failure envelope in the body. SPEC.md 5.3:
+  #                      the worker replied, in the envelope, that the work
+  #                      failed  ->  worker_error
+  #   http_500           a non-2xx reply. SPEC.md 5.3 lists non-2xx under
+  #                      transport_error, NOT under worker_error: the HTTP
+  #                      exchange did not produce a usable reply
+  #   fail_then_succeed  fails params.fail_times times for this (run_id,
+  #                      step_id) pair, then succeeds. Leg 1
+  #
+  # The fourth way a worker fails - not being there at all - needs no mode and
+  # no code: workflow-unreachable.json points worker_url at port 9099 of this
+  # same container, where nothing listens, and the connection is refused.
+  #
+  # WHY THE COUNTER IS KEYED ON (run_id, step_id)
+  #   The envelope carries no attempt number (SPEC.md 9.5), so "how many times
+  #   have I been asked to do this step" is something only the worker can know.
+  #   The count is in memory and dies with the container, which is right for a
+  #   demo fixture: SPEC.md 1 forbids the SYSTEM from making anything in memory
+  #   load-bearing, and this worker is not the system.
+  worker:
+    image: python:3.13-alpine
+    command:
+      - python
+      - -u
+      - -c
+      - |
+        import json, threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        seen = {}
+        lock = threading.Lock()
+
+        def calls_so_far(key):
+            with lock:
+                seen[key] = seen.get(key, 0) + 1
+                return seen[key]
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                if self.path == "/healthz":
+                    self._reply(200, {"status": "ok"})
+                else:
+                    self._reply(404, {"status": "failure",
+                                      "error": "no such path: " + self.path})
+
+            def do_POST(self):
+                if self.path != "/work":
+                    self._reply(404, {"status": "failure",
+                                      "error": "no such path: " + self.path})
+                    return
+                length = int(self.headers.get("content-length") or 0)
+                body = self.rfile.read(length) if length else b""
+                try:
+                    env = json.loads(body or b"{}")
+                except Exception as exc:
+                    self._reply(400, {"status": "failure",
+                                      "error": "unparseable body: %s" % exc})
+                    return
+
+                params = env.get("params") or {}
+                mode = params.get("mode", "echo")
+                key = (env.get("run_id"), env.get("step_id"))
+                n = calls_so_far(key)
+
+                if mode == "fail_then_succeed":
+                    if n <= int(params.get("fail_times", 0)):
+                        self._fail_envelope(
+                            "fail_then_succeed: call %d for this step, "
+                            "failing the first %s" % (n, params.get("fail_times")))
+                    else:
+                        self._succeed(env, n, mode)
+                elif mode == "worker_error":
+                    self._fail_envelope(
+                        "worker_error: this worker was asked to report business "
+                        "failure (call %d)" % n)
+                elif mode == "http_500":
+                    # SPEC.md 9.6: a transport-level failure is a failure
+                    # regardless of body. The body here is diagnostic only.
+                    self._reply(500, {"status": "failure",
+                                      "error": "http_500: deliberate non-2xx (call %d)" % n})
+                else:
+                    self._succeed(env, n, mode)
+
+            def _succeed(self, env, n, mode):
+                # SPEC.md 9.6, the sync + envelope success shape.
+                self._reply(200, {"status": "success",
+                                  "output": {"mode": mode,
+                                             "call_number_for_this_step": n,
+                                             "run_id": env.get("run_id"),
+                                             "step_id": env.get("step_id"),
+                                             "attempt_id": env.get("attempt_id")}})
+
+            def _fail_envelope(self, message):
+                # SPEC.md 9.6: a sync + envelope failure is a 200 whose BODY
+                # says failure. Replying non-2xx here would produce
+                # transport_error instead, and the leg would stop demonstrating
+                # the thing it exists to demonstrate.
+                self._reply(200, {"status": "failure", "error": message})
+
+            def _reply(self, code, payload):
+                raw = json.dumps(payload).encode("utf-8")
+                self.send_response(code)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, fmt, *args):
+                print("worker: " + (fmt % args), flush=True)
+
+        print("worker: listening on 0.0.0.0:9090", flush=True)
+        ThreadingHTTPServer(("0.0.0.0", 9090), Handler).serve_forever()
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:9090/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+
+volumes:
+  pgdata:
