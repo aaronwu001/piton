@@ -234,7 +234,7 @@ Ownership **expires**, and it expires because of the orchestrator, not because o
 run, renewed by a ticking `UPDATE` — rewrites every running run's row every few seconds, producing
 continuous churn on the busiest table in the system, and mixes coordination metadata into business
 state. One row per process is O(1) regardless of load, and `runs.owner_id` then changes only on the
-rare, meaningful events of claim and release.
+rare, meaningful events of claim, release, and a run becoming terminal (§8.7).
 
 **Why ownership must expire at all:** if it did not, a dead orchestrator would own its runs forever
 and something else would have to detect its death and clear the field — which is the original
@@ -298,8 +298,10 @@ environment definition, or a green suite proves nothing about what he saw by han
 | `DONE` | The worker reported success. `attempts.output` holds the response body verbatim |
 | `FAILED` | The attempt did not succeed, for one of the reasons below |
 
-`failure_reason` is a **diagnostic label, not a distinct mechanism**. Every value below burns one
-unit of budget except `cancelled`:
+`failure_reason` is a **diagnostic label, not a distinct mechanism**, and no value below changes
+`steps.attempt_count`: §4.2 burns one unit of budget when an attempt is **dispatched**, not when its
+outcome is written. `cancelled` is the exception in the other direction — the cancel transaction
+zeroes the counter (§5.7):
 
 | `failure_reason` | Meaning |
 |---|---|
@@ -308,7 +310,7 @@ unit of budget except `cancelled`:
 | `invalid_response` | A reply arrived, but could not be parsed as the mode requires |
 | `timeout` | **`deadline_at` passed** before any outcome was written |
 | `orphaned` | `timeout`, where the attempt's dispatching orchestrator was not live when the attempt was expired |
-| `cancelled` | The run was cancelled while this attempt was `RUNNING`. **Does not burn budget** |
+| `cancelled` | The run was cancelled while this attempt was `RUNNING`. **The step's `attempt_count` is zeroed** (§5.7) |
 
 **Why `invalid_response` is its own value rather than folded into `worker_error` or
 `transport_error`:** the three name three different repairs — the worker's business logic, the
@@ -386,13 +388,21 @@ Each of these is impossible because of a transaction boundary, not because of a 
 
 One sentence covers all three cancelled combinations with no special cases:
 
-> `run → CANCELLED`. If `last_step = RUNNING`, then `last_step → CANCELLED` and its `RUNNING`
-> attempt → `FAILED(cancelled)` with `attempt_count` **unchanged**. Otherwise the last step keeps
-> the terminal state it already had (`DONE` or `DLQ`).
+> `run → CANCELLED`. If `last_step = RUNNING`, then `last_step → CANCELLED`, its `RUNNING`
+> attempt → `FAILED(cancelled)`, and that step's `attempt_count` is **set to 0**. Otherwise the last
+> step keeps the terminal state it already had (`DONE` or `DLQ`).
 
-**Why `attempt_count` is not incremented:** cancellation is not the worker's failure, and the step
-is terminal either way, so the budget is irrelevant. Incrementing it would put a misleading number
-in front of the operator.
+**Why `attempt_count` is zeroed rather than left as it was:** the number is never read again. A
+`CANCELLED` run is terminal (§5.1), and §14 replays only a run that is in `DLQ`, so no budget check
+will ever consult it. Leaving a half-spent budget behind would therefore buy nothing and would cost
+a rule — what a partly-consumed budget means on a step that will never be dispatched again. Zero is
+also the one value that cannot be misread as a verdict about the worker: cancellation is not the
+worker's failure, and the step is terminal either way.
+
+**Why this does not contradict "budget is burned at dispatch" (§4.2):** it is not a refund. The
+attempts that were dispatched keep their rows and their `failure_reason`, so what happened is still
+visible; only the counter that governs a future dispatch is cleared, and there is no future
+dispatch.
 
 **Why a DLQ verdict is never rewritten:** it is a historical fact about what happened to that step.
 Cancelling the run afterwards does not change what the step did, and L8 exists precisely to record
@@ -458,7 +468,8 @@ every sweep. Validating at submission makes that state unreachable.
 | `claimed_at` | TIMESTAMPTZ | yes | **Coordination metadata.** When the current owner claimed it |
 | `created_at` | TIMESTAMPTZ | no | |
 
-Invariants: `owner_id` is non-`NULL` only while `status = 'RUNNING'`; `planner_attempt_count ≤
+Invariants: `owner_id` and `claimed_at` are non-`NULL` only while `status = 'RUNNING'`, and are
+always written and cleared as a pair (§8.7); `planner_attempt_count ≤
 planner_max_attempts` of the workflow; the pair (`status`, derived `last_step`) is always one of
 L1–L8.
 
@@ -504,9 +515,10 @@ result. Once stored, that is a present output belonging to a step that may or ma
 and a backend is free to encode it in a way that makes "absent" and "the value null"
 indistinguishable at the SQL level. `status` is unambiguous in every backend.
 
-**Why `attempt_count` is stored rather than derived as `COUNT(attempts)`:** a cancelled attempt does
-not burn budget (§5.7), so the two numbers legitimately differ. Deriving it would make cancellation
-consume budget as a side effect.
+**Why `attempt_count` is stored rather than derived as `COUNT(attempts)`:** the two numbers
+legitimately differ. §5.7 zeroes it on cancellation and §14 resets it on replay, and both leave the
+`attempts` rows in place — so a step may hold three attempt rows and an `attempt_count` of 0.
+Deriving it would make cancellation and replay consume budget as a side effect.
 
 **Why the whole response body is stored:** Piton does not shape outputs. Selecting a field out of a
 worker's response is the planner's job, not the engine's.
@@ -829,9 +841,30 @@ On a clean shutdown the orchestrator **releases**: `UPDATE runs SET owner_id = N
 NULL WHERE owner_id = :me`. This is an optimisation that makes failover immediate rather than
 `lease_ttl` later; correctness does not depend on it.
 
-Exactly **three** operations may write coordination metadata: **claim**, **heartbeat**, and
-**release**. Cancellation additionally sets `owner_id = NULL`, which is belt-and-braces — the sweep
-already filters on `status = 'RUNNING'`.
+Coordination metadata is written in exactly **four** places, and nowhere else:
+
+| Operation | Effect |
+|---|---|
+| **claim** (§8.5) | `owner_id = :me`, `claimed_at = now()` |
+| **heartbeat** | `orchestrators.last_seen_at = now()`; the run's own columns are not touched |
+| **release**, on clean shutdown | `owner_id = NULL, claimed_at = NULL WHERE owner_id = :me` |
+| **any transition of a run out of `RUNNING`** | `owner_id = NULL, claimed_at = NULL`, in the same transaction as the status change |
+
+The fourth is what makes §6.2's invariant — "`owner_id` and `claimed_at` are non-`NULL` only while
+`status = 'RUNNING'`" — true rather than merely asserted. It covers all three exits: `→ DONE`
+(§4.2), `→ DLQ` (§12.2, worker-side and planner-side alike), and `→ CANCELLED` (§15).
+
+**Why in the same transaction, and not in a tidy-up pass:** a separate pass is a rule that has to be
+remembered at every call site, which is the same class of mistake §8.2 rejects — one forgotten
+transaction and the column silently lies. Written with the status change, the invariant cannot be
+violated even for an instant.
+
+**Why this is not cosmetic tidying:** the driver that writes the terminal status clears its own
+ownership in the same breath, so its next ownership fence (§8.2) on that run returns zero rows and
+it stops silently — exactly what §4.2 step 1 already prescribes. The fence and the state machine
+agree by construction rather than by coincidence.
+
+Cancellation is not doing this "belt-and-braces": it is this rule applied to one of the three exits.
 
 ---
 
@@ -1225,18 +1258,24 @@ that branch will outlive the reason for it.
 ### 12.2 Budget and the transition to DLQ
 
 ```
-step:    attempt fails → steps.attempt_count += 1
-                       → attempt_count < step_max_attempts ? dispatch again : step → DLQ, run → DLQ
-planner: call fails    → runs.planner_attempt_count += 1
-                       → count < planner_max_attempts ? call again : run → DLQ
+step:    attempt dispatched → steps.attempt_count += 1     (§4.2, at dispatch, not at the outcome)
+         attempt fails      → attempt_count < step_max_attempts ? dispatch again
+                                                                : step → DLQ, run → DLQ
+planner: call fails         → runs.planner_attempt_count += 1
+                            → count < planner_max_attempts ? call again : run → DLQ
 ```
 
 `step → DLQ`, `run → DLQ` and the dead-letter entry are written in **one transaction**.
 **Why:** it is what makes `run=RUNNING, last_step=DLQ` impossible (§5.6).
 
-**Unbounded retry is structurally impossible.** Every failure, including one caused by a crash
-during recovery, increments a persisted counter, so every in-flight step converges monotonically
-towards DLQ. A crash loop cannot spin forever; it burns budget on each pass and stops.
+**Unbounded retry is structurally impossible.** Every dispatch increments a persisted counter
+**before the work begins** (§4.2), so no crash afterwards — including one during recovery — can undo
+it, and every in-flight step converges monotonically towards DLQ. A crash loop cannot spin forever;
+it burns budget on each pass and stops.
+
+The two counters are incremented at different moments, and the asymmetry is not an oversight: a
+worker attempt has a dispatch to hang the increment on, and a planner call does not — there is no
+row and no step, so the failure itself is the only event there is (§6.2).
 
 ### 12.3 Worker-side versus planner-side DLQ
 
@@ -1335,7 +1374,9 @@ Targeting the run deletes that entire class of confusion.
 
 **What replay does**, in one transaction: increment `runs.replay_count`; `run → RUNNING`; if
 `last_step = DLQ`, that step returns to `RUNNING` with `attempt_count` reset to 0; reset
-`planner_attempt_count` to 0; clear `owner_id` so the next sweep picks it up.
+`planner_attempt_count` to 0; clear `owner_id` and `claimed_at` so the next sweep picks it up —
+under §8.7 a `DLQ` run already holds both as `NULL`, so this is a restatement for the reader, not a
+second mechanism.
 
 **`run_id` never changes.** A run is the unit of history; forking it would duplicate step history
 and break "one run, one story". A run may be replayed as many times as it lands in DLQ, and
@@ -1362,9 +1403,10 @@ the operator has decided to abandon stays in DLQ forever.
 The transition is §5.7's uniform rule, applied in one transaction:
 
 ```sql
-UPDATE runs SET status = 'CANCELLED', owner_id = NULL
+UPDATE runs SET status = 'CANCELLED', owner_id = NULL, claimed_at = NULL
 WHERE run_id = :rid AND status IN ('RUNNING', 'DLQ');
--- plus, if the last step is RUNNING: step → CANCELLED, its RUNNING attempt → FAILED('cancelled')
+-- plus, if the last step is RUNNING: step → CANCELLED with attempt_count = 0,
+--                                    its RUNNING attempt → FAILED('cancelled')
 ```
 
 Resulting combinations: **L6**, **L7**, **L8** (§5.5). If the last step's attempt has already
@@ -1404,7 +1446,10 @@ produces dead-letter entries and wastes triage.
    `step_retry_delay_seconds` (§11.1).
 
 `POST /workflows/{id}/runs` returns 400 for a non-empty `overrides` (§11.2), a missing `input`, or
-an unknown key.
+an unknown key. `overrides` may be `{}`, `null`, or omitted; all three mean "no overrides".
+**Why `null` and omission are accepted:** §9.4 gives the same feature's step-level fields the default
+`null` and permits omission, and §9.8 rule 5 rejects only a non-`null` value. The two halves of one
+feature must not disagree about the same JSON value.
 
 Planner responses are validated at run time under §9.3 and §9.8, because they cannot be seen
 earlier.
@@ -1515,6 +1560,13 @@ planner author builds against, but α's planner is the built-in static one, whic
 fetches nothing. α therefore implements `POST /workflows`, `POST /workflows/{id}/runs`,
 `GET /runs/{run_id}`, `GET /runs/{run_id}/steps` and `GET /healthz`. The remaining read endpoints
 land with **ζ**, the first milestone that has a planner able to call them.
+
+**Which validation α implements.** All of §16, and therefore §9.4 and §9.8 in full for every element
+of `planner_static_steps`.
+**Why it is not deferred to ι:** §6.1 already requires the static plan to be validated at
+`POST /workflows` — a malformed StepSpec discovered at run time leaves a run that can neither
+progress nor fail — so the validator exists in α regardless, and the rest of §16's list is a few
+checks on the same parse. **ι demonstrates validation; it does not introduce it.**
 
 **What α deliberately does not demonstrate:** retries, DLQ, crash recovery, replay, cancellation,
 raw dispatch, async, an HTTP planner, or any override. Each has its own milestone.

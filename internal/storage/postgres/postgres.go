@@ -1,0 +1,500 @@
+// Package postgres is the Postgres implementation of storage.Store.
+//
+// It is the only implementation today. SPEC.md 4.4 makes the backend a value in
+// the configuration file so that it stays one implementation of an interface
+// rather than an assumption baked through the system, and SPEC.md 7.1 keeps
+// every JSON document opaque at the boundary: jsonb appears here and nowhere
+// above.
+//
+// SPEC.md 7.3 lists the four atomicity and isolation obligations the
+// correctness argument of SPEC.md 8 rests on. Postgres provides all four under
+// READ COMMITTED, which is its default and the isolation level used here — in
+// particular obligation 3, that "an UPDATE blocked by a row lock must
+// re-evaluate its WHERE clause after the lock is released", without which two
+// orchestrators could both conclude a run was unowned.
+package postgres
+
+import (
+	"context"
+	"database/sql"
+	"embed"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/golang-migrate/migrate/v4"
+	migratepg "github.com/golang-migrate/migrate/v4/database/postgres"
+	"github.com/golang-migrate/migrate/v4/source/iofs"
+	_ "github.com/lib/pq"
+
+	"github.com/aaronwu001/piton/internal/model"
+	"github.com/aaronwu001/piton/internal/storage"
+)
+
+//go:embed migrations/*.sql
+var migrationFiles embed.FS
+
+// Store is a storage.Store backed by one Postgres database.
+type Store struct {
+	db *sql.DB
+}
+
+// Open connects to the database named by the DSN. It does not verify the
+// connection: SPEC.md 13.1 case 5 wants a startup failure that "names storage
+// as the cause", and that message is produced by the caller's Ping, where the
+// difference between "cannot parse the DSN" and "cannot reach the server" is
+// still visible.
+func Open(dsn string) (*Store, error) {
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: cannot open storage: %w", err)
+	}
+	// One process, one heartbeat, one sweep and a handful of drivers. The pool
+	// is bounded so that a storm of drivers cannot open connections without
+	// limit, which would turn a slow worker into a database outage.
+	db.SetMaxOpenConns(16)
+	db.SetMaxIdleConns(8)
+	db.SetConnMaxLifetime(time.Hour)
+	return &Store{db: db}, nil
+}
+
+func (s *Store) Close() error { return s.db.Close() }
+
+func (s *Store) Ping(ctx context.Context) error {
+	if err := s.db.PingContext(ctx); err != nil {
+		return fmt.Errorf("postgres: storage is unreachable: %w", err)
+	}
+	return nil
+}
+
+// Migrate applies every migration in migrations/. SPEC.md 18.1 requires this to
+// run to completion before the orchestrator serves traffic; demos/alpha's
+// environment has no migration service, so a 200 from GET /healthz is what
+// proves it finished.
+func (s *Store) Migrate(ctx context.Context) error {
+	src, err := iofs.New(migrationFiles, "migrations")
+	if err != nil {
+		return fmt.Errorf("postgres: cannot read embedded migrations: %w", err)
+	}
+	drv, err := migratepg.WithInstance(s.db, &migratepg.Config{})
+	if err != nil {
+		return fmt.Errorf("postgres: cannot prepare the migration driver: %w", err)
+	}
+	m, err := migrate.NewWithInstance("iofs", src, "postgres", drv)
+	if err != nil {
+		return fmt.Errorf("postgres: cannot prepare migrations: %w", err)
+	}
+	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		return fmt.Errorf("postgres: migrations failed: %w", err)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// The operator's surface (SPEC.md 10.1, 10.2)
+// ---------------------------------------------------------------------------
+
+func (s *Store) CreateWorkflow(ctx context.Context, wf *model.Workflow) error {
+	const q = `
+INSERT INTO workflows (workflow_id, name, planner_type, planner_url, planner_static_steps,
+                       step_timeout_seconds, step_max_attempts, step_retry_delay_seconds,
+                       planner_timeout_seconds, planner_max_attempts)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+RETURNING created_at;`
+	err := s.db.QueryRowContext(ctx, q,
+		wf.WorkflowID, wf.Name, wf.PlannerType,
+		nullString(wf.PlannerURL), jsonParam(wf.PlannerStaticSteps),
+		wf.StepTimeoutSeconds, wf.StepMaxAttempts, wf.StepRetryDelaySeconds,
+		wf.PlannerTimeoutSeconds, wf.PlannerMaxAttempts,
+	).Scan(&wf.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("postgres: cannot create workflow: %w", err)
+	}
+	return nil
+}
+
+const workflowColumns = `workflow_id, name, planner_type, planner_url, planner_static_steps,
+       step_timeout_seconds, step_max_attempts, step_retry_delay_seconds,
+       planner_timeout_seconds, planner_max_attempts, created_at`
+
+func scanWorkflow(row interface{ Scan(...any) error }) (*model.Workflow, error) {
+	var (
+		wf    model.Workflow
+		url   sql.NullString
+		steps []byte
+	)
+	err := row.Scan(&wf.WorkflowID, &wf.Name, &wf.PlannerType, &url, &steps,
+		&wf.StepTimeoutSeconds, &wf.StepMaxAttempts, &wf.StepRetryDelaySeconds,
+		&wf.PlannerTimeoutSeconds, &wf.PlannerMaxAttempts, &wf.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	wf.PlannerURL = url.String
+	wf.PlannerStaticSteps = steps
+	return &wf, nil
+}
+
+func (s *Store) GetWorkflow(ctx context.Context, workflowID string) (*model.Workflow, error) {
+	if !isUUID(workflowID) {
+		// SPEC.md 10.5's 404 is "no such entity". A malformed identifier names
+		// no entity, and letting it reach Postgres would turn it into a type
+		// error — a 500 for a question whose answer is simply "no".
+		return nil, storage.ErrNotFound
+	}
+	row := s.db.QueryRowContext(ctx,
+		`SELECT `+workflowColumns+` FROM workflows WHERE workflow_id = $1;`, workflowID)
+	wf, err := scanWorkflow(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, storage.ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("postgres: cannot read workflow: %w", err)
+	}
+	return wf, nil
+}
+
+func (s *Store) CreateRun(ctx context.Context, run *model.Run) error {
+	const q = `
+INSERT INTO runs (run_id, workflow_id, status, input)
+VALUES ($1, $2, $3, $4)
+RETURNING created_at;`
+	err := s.db.QueryRowContext(ctx, q, run.RunID, run.WorkflowID, run.Status, jsonParam(run.Input)).
+		Scan(&run.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("postgres: cannot create run: %w", err)
+	}
+	return nil
+}
+
+const runColumns = `run_id, workflow_id, status, input, planner_attempt_count, replay_count,
+       last_planner_error, owner_id, claimed_at, created_at`
+
+func scanRun(row interface{ Scan(...any) error }) (*model.Run, error) {
+	var (
+		run       model.Run
+		lastErr   sql.NullString
+		ownerID   sql.NullString
+		claimedAt sql.NullTime
+	)
+	err := row.Scan(&run.RunID, &run.WorkflowID, &run.Status, &run.Input,
+		&run.PlannerAttemptCount, &run.ReplayCount, &lastErr, &ownerID, &claimedAt, &run.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	if lastErr.Valid {
+		run.LastPlannerError = &lastErr.String
+	}
+	if ownerID.Valid {
+		run.OwnerID = &ownerID.String
+	}
+	if claimedAt.Valid {
+		run.ClaimedAt = &claimedAt.Time
+	}
+	return &run, nil
+}
+
+func (s *Store) GetRun(ctx context.Context, runID string) (*model.Run, error) {
+	if !isUUID(runID) {
+		return nil, storage.ErrNotFound
+	}
+	row := s.db.QueryRowContext(ctx, `SELECT `+runColumns+` FROM runs WHERE run_id = $1;`, runID)
+	run, err := scanRun(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, storage.ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("postgres: cannot read run: %w", err)
+	}
+	return run, nil
+}
+
+const stepColumns = `step_id, run_id, seq, step_name, status, decision, attempt_count,
+       output, created_at, completed_at`
+
+func scanStep(row interface{ Scan(...any) error }) (*model.Step, error) {
+	var (
+		st          model.Step
+		name        sql.NullString
+		completedAt sql.NullTime
+	)
+	err := row.Scan(&st.StepID, &st.RunID, &st.Seq, &name, &st.Status, &st.Decision,
+		&st.AttemptCount, &st.Output, &st.CreatedAt, &completedAt)
+	if err != nil {
+		return nil, err
+	}
+	if name.Valid {
+		st.StepName = &name.String
+	}
+	if completedAt.Valid {
+		st.CompletedAt = &completedAt.Time
+	}
+	return &st, nil
+}
+
+func (s *Store) ListSteps(ctx context.Context, runID string) ([]*model.Step, error) {
+	if !isUUID(runID) {
+		return nil, storage.ErrNotFound
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+stepColumns+` FROM steps WHERE run_id = $1 ORDER BY seq;`, runID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: cannot list steps: %w", err)
+	}
+	defer rows.Close()
+
+	out := []*model.Step{}
+	for rows.Next() {
+		st, err := scanStep(rows)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: cannot read a step: %w", err)
+		}
+		out = append(out, st)
+	}
+	return out, rows.Err()
+}
+
+const attemptColumns = `attempt_id, step_id, run_id, attempt_no, status, connection_mode,
+       deadline_at, dispatched_by, output, failure_reason, error_text, started_at, finished_at`
+
+func scanAttempt(row interface{ Scan(...any) error }) (*model.Attempt, error) {
+	var (
+		at         model.Attempt
+		reason     sql.NullString
+		errText    sql.NullString
+		finishedAt sql.NullTime
+	)
+	err := row.Scan(&at.AttemptID, &at.StepID, &at.RunID, &at.AttemptNo, &at.Status,
+		&at.ConnectionMode, &at.DeadlineAt, &at.DispatchedBy, &at.Output,
+		&reason, &errText, &at.StartedAt, &finishedAt)
+	if err != nil {
+		return nil, err
+	}
+	if reason.Valid {
+		at.FailureReason = &reason.String
+	}
+	if errText.Valid {
+		at.ErrorText = &errText.String
+	}
+	if finishedAt.Valid {
+		at.FinishedAt = &finishedAt.Time
+	}
+	return &at, nil
+}
+
+func (s *Store) ListAttempts(ctx context.Context, runID string) ([]*model.Attempt, error) {
+	if !isUUID(runID) {
+		return nil, storage.ErrNotFound
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+attemptColumns+` FROM attempts WHERE run_id = $1 ORDER BY started_at, attempt_no;`,
+		runID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: cannot list attempts: %w", err)
+	}
+	defer rows.Close()
+
+	out := []*model.Attempt{}
+	for rows.Next() {
+		at, err := scanAttempt(rows)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: cannot read an attempt: %w", err)
+		}
+		out = append(out, at)
+	}
+	return out, rows.Err()
+}
+
+// StepOutputAtSeq returns the identity and stored output of the run's step at
+// one position, provided that step is DONE.
+//
+// SPEC.md 9.4's default for input_from — "omitted ⇒ the previous step only" —
+// is a position, so this is how that default is resolved. storage.ErrNotFound
+// means there is no such completed step, which at seq 0 is simply "this is the
+// run's first step".
+func (s *Store) StepOutputAtSeq(ctx context.Context, runID string, seq int) (string, []byte, error) {
+	if !isUUID(runID) {
+		return "", nil, storage.ErrNotFound
+	}
+	var (
+		stepID string
+		output []byte
+	)
+	// SPEC.md 6.3: completion is read from status and never from the presence
+	// of an output, "a worker may legitimately return the JSON document null,
+	// or an empty object, as its result".
+	err := s.db.QueryRowContext(ctx,
+		`SELECT step_id, output FROM steps WHERE run_id = $1 AND seq = $2 AND status = 'DONE';`,
+		runID, seq).Scan(&stepID, &output)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil, storage.ErrNotFound
+	}
+	if err != nil {
+		return "", nil, fmt.Errorf("postgres: cannot read a step's output: %w", err)
+	}
+	return stepID, output, nil
+}
+
+// StepOutputByID returns one completed step's stored output, by identity.
+func (s *Store) StepOutputByID(ctx context.Context, runID, stepID string) ([]byte, error) {
+	if !isUUID(runID) || !isUUID(stepID) {
+		return nil, storage.ErrNotFound
+	}
+	var output []byte
+	err := s.db.QueryRowContext(ctx,
+		`SELECT output FROM steps WHERE run_id = $1 AND step_id = $2 AND status = 'DONE';`,
+		runID, stepID).Scan(&output)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, storage.ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("postgres: cannot read a step's output: %w", err)
+	}
+	return output, nil
+}
+
+// ---------------------------------------------------------------------------
+// Coordination metadata (SPEC.md 3.4, 8.5, 8.7)
+// ---------------------------------------------------------------------------
+
+// RegisterOrchestrator writes this process's row (SPEC.md 6.6: one row per
+// process boot).
+func (s *Store) RegisterOrchestrator(ctx context.Context, orchestratorID string) error {
+	const q = `
+INSERT INTO orchestrators (orchestrator_id, started_at, last_seen_at)
+VALUES ($1, now(), now());`
+	if _, err := s.db.ExecContext(ctx, q, orchestratorID); err != nil {
+		return fmt.Errorf("postgres: cannot register orchestrator: %w", err)
+	}
+	return nil
+}
+
+// Heartbeat is SPEC.md 8.7's statement, unchanged. One row per process, O(1)
+// regardless of how many runs the process owns, and last_seen_at is the only
+// column it touches (SPEC.md 6.6).
+func (s *Store) Heartbeat(ctx context.Context, orchestratorID string) error {
+	const q = `UPDATE orchestrators SET last_seen_at = now() WHERE orchestrator_id = $1;`
+	if _, err := s.db.ExecContext(ctx, q, orchestratorID); err != nil {
+		return fmt.Errorf("postgres: heartbeat failed: %w", err)
+	}
+	return nil
+}
+
+// ReleaseOwned is SPEC.md 8.7's clean-shutdown release. It "is an optimisation
+// that makes failover immediate rather than lease_ttl later; correctness does
+// not depend on it".
+func (s *Store) ReleaseOwned(ctx context.Context, orchestratorID string) error {
+	const q = `UPDATE runs SET owner_id = NULL, claimed_at = NULL WHERE owner_id = $1;`
+	if _, err := s.db.ExecContext(ctx, q, orchestratorID); err != nil {
+		return fmt.Errorf("postgres: release failed: %w", err)
+	}
+	return nil
+}
+
+// ClaimRuns is SPEC.md 8.5, unchanged: one atomic statement, so that "exactly
+// one orchestrator wins each run even when every replica sweeps at the same
+// instant. There is no designated sweeper and no election."
+//
+// SPEC.md 8.6: because it filters on status = 'RUNNING', DONE, DLQ and
+// CANCELLED runs are never claimed, and "never scanned" in SPEC.md 5.5's table
+// is mechanical rather than a convention.
+func (s *Store) ClaimRuns(ctx context.Context, orchestratorID string, leaseTTL time.Duration) ([]string, error) {
+	const q = `
+UPDATE runs r SET owner_id = $1, claimed_at = now()
+WHERE r.status = 'RUNNING'
+  AND (r.owner_id IS NULL
+       OR NOT EXISTS (SELECT 1 FROM orchestrators o
+                      WHERE o.orchestrator_id = r.owner_id
+                        AND o.last_seen_at > now() - make_interval(secs => $2)))
+RETURNING r.run_id;`
+	rows, err := s.db.QueryContext(ctx, q, orchestratorID, leaseTTL.Seconds())
+	if err != nil {
+		return nil, fmt.Errorf("postgres: claim failed: %w", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("postgres: claim failed: %w", err)
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// OwnedRunningRuns lists the RUNNING runs this orchestrator already owns.
+//
+// It is not part of SPEC.md 8.5's claim. It exists because SPEC.md 13.1 case 2
+// requires "a single run's driver dies while the process lives" to be survived:
+// such a run is still owned by a live orchestrator, so ClaimRuns will never
+// return it, and only the owner itself can notice that nothing is driving it.
+func (s *Store) OwnedRunningRuns(ctx context.Context, orchestratorID string) ([]string, error) {
+	const q = `SELECT run_id FROM runs WHERE owner_id = $1 AND status = 'RUNNING';`
+	rows, err := s.db.QueryContext(ctx, q, orchestratorID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: cannot list owned runs: %w", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("postgres: cannot list owned runs: %w", err)
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+func nullString(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+// jsonParam binds one of SPEC.md 7.1's opaque JSON documents to a jsonb
+// parameter, and NULL when there is none.
+//
+// The conversion to string is not cosmetic. lib/pq encodes a []byte parameter
+// as bytea, so a document passed as bytes would arrive at a jsonb column as the
+// hex text \x7b… and be rejected. A string is sent as text and parsed as jsonb,
+// which is what SPEC.md 7.1 describes: "the Postgres implementation stores
+// these as jsonb internally", while the interface above deals only in bytes.
+func jsonParam(b []byte) any {
+	if len(b) == 0 {
+		return nil
+	}
+	return string(b)
+}
+
+// isUUID recognises the canonical hyphenated form. It is a shape test, not a
+// validity test: its only job is to keep a malformed path parameter from
+// reaching a uuid-typed column, where it would raise a type error instead of
+// the 404 SPEC.md 10.5 calls for.
+func isUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i := 0; i < 36; i++ {
+		c := s[i]
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			isHex := (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+			if !isHex {
+				return false
+			}
+		}
+	}
+	return true
+}

@@ -1,0 +1,190 @@
+# Milestone alpha - environment definition.
+#
+# SPEC.md 18.1 names this file and fixes its shape: "Three services: postgres,
+# orchestrator, worker (a trivial echo worker)". There are exactly three here,
+# and no fourth is added - which is what forces the migration decision below.
+#
+# SPEC.md 4.4 requires the orchestrator and the database to be separate
+# containers, and requires that the automated suite reference THIS file rather
+# than define an environment of its own (CLAUDE.md 5.5.4), so that the owner's
+# hand-run demo and the suite run against an identical definition.
+#
+# Teardown between runs is `docker compose down -v`. The volume wipe is not
+# optional: CLAUDE.md 5.5.2 requires every group to start from a clean database.
+
+name: piton-alpha
+
+services:
+
+  # ---------------------------------------------------------------- postgres
+  postgres:
+    image: postgres:18.6-alpine
+    environment:
+      POSTGRES_USER: piton
+      POSTGRES_PASSWORD: piton
+      POSTGRES_DB: piton
+    volumes:
+      # Postgres 18+ wants ONE mount at /var/lib/postgresql, not at
+      # /var/lib/postgresql/data as every pre-18 example shows. The image
+      # refuses to start with the older mount point. See
+      # docker-library/postgres#1259.
+      - pgdata:/var/lib/postgresql
+    # No host port is published, deliberately. A fixed host port collides with
+    # any Postgres the operator already runs, and a collision would break the
+    # unattended demo. SPEC.md 17's requirement - "the owner must be able to
+    # run the system by hand and see inside it from a terminal" - is served by
+    #
+    #   docker compose exec -T postgres psql -U piton -d piton
+    #
+    # which needs nothing installed on the host, and is what demo.sh itself uses.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U piton -d piton"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+
+  # ------------------------------------------------------------ orchestrator
+  orchestrator:
+    build:
+      # The build context is the repository root: the orchestrator is the
+      # product, not a demo fixture. The Dockerfile is inline because SPEC.md
+      # 18.1's environment table lists four files for this directory, and no
+      # ruling covers where a separate build file would otherwise live. When
+      # the implementation lands and wants a real Dockerfile, this key becomes
+      # `dockerfile: <path>` and nothing else in this file changes.
+      context: ../..
+      dockerfile_inline: |
+        FROM golang:1.27-alpine AS build
+        WORKDIR /src
+        COPY . .
+        RUN CGO_ENABLED=0 go build -trimpath -o /out/piton ./cmd/piton
+
+        FROM alpine:3.22
+        COPY --from=build /out/piton /usr/local/bin/piton
+        ENTRYPOINT ["/usr/local/bin/piton"]
+    # SPEC.md 4.4 says the orchestrator "reads one YAML configuration file at
+    # boot" but does not fix how it is told which file. `--config` is this
+    # demo's choice, not a rule. See the header of piton.yaml.
+    command: ["--config", "/etc/piton/piton.yaml"]
+    volumes:
+      - ./piton.yaml:/etc/piton/piton.yaml:ro
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # Not an architectural dependency - the orchestrator does not need a
+      # worker in order to boot. It is here for demo determinism: if the worker
+      # were not yet listening when step 1 dispatched, the attempt would fail
+      # with transport_error (SPEC.md 5.3) and be retried, and the milestone's
+      # required assertion `attempt_count = 1` would then fail for a reason
+      # that has nothing to do with the code under test.
+      worker:
+        condition: service_healthy
+    # SPEC.md 18.1's script carries the comment "migrations run to completion
+    # before the orchestrator serves traffic". With exactly three services
+    # there is no migration container, so the orchestrator must apply
+    # migrations at boot and bind its listener only afterwards. That makes a
+    # 200 from /healthz proof that migrations finished - which is exactly what
+    # demo.sh waits on before it does anything else.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8080/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+      start_period: 5s
+
+  # ------------------------------------------------------------------ worker
+  #
+  # The trivial echo worker of SPEC.md 18.1. It speaks exactly one combination:
+  # sync + envelope, the only one legal in alpha (SPEC.md 9.7).
+  #
+  # It does one thing beyond echoing: it reports back what the envelope it
+  # received actually contained. SPEC.md 9.5 says a sync envelope carries
+  # run_id, step_id, attempt_id, connection_mode, params and inputs, and that
+  # callback_url is "omitted entirely" in sync mode. By returning those
+  # observations as its output, the envelope contract becomes a row in
+  # steps.output that demo.sh can assert in SQL - rather than something only a
+  # log line would ever have shown.
+  worker:
+    image: python:3.13-alpine
+    command:
+      - python
+      - -u
+      - -c
+      - |
+        import json
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        # The fields SPEC.md 9.5 defines for a sync envelope.
+        REQUIRED = ("run_id", "step_id", "attempt_id",
+                    "connection_mode", "params", "inputs")
+        KNOWN = set(REQUIRED) | {"callback_url"}
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                if self.path == "/healthz":
+                    self._reply(200, {"status": "ok"})
+                else:
+                    self._reply(404, {"status": "failure",
+                                      "error": "no such path: " + self.path})
+
+            def do_POST(self):
+                if self.path != "/echo":
+                    self._reply(404, {"status": "failure",
+                                      "error": "no such path: " + self.path})
+                    return
+                length = int(self.headers.get("content-length") or 0)
+                body = self.rfile.read(length) if length else b""
+                try:
+                    env = json.loads(body or b"{}")
+                except Exception as exc:
+                    self._reply(400, {"status": "failure",
+                                      "error": "unparseable body: %s" % exc})
+                    return
+                if not isinstance(env, dict):
+                    self._reply(400, {"status": "failure",
+                                      "error": "envelope is not a JSON object"})
+                    return
+
+                inputs = env.get("inputs")
+                observed = {
+                    "run_id": env.get("run_id"),
+                    "step_id": env.get("step_id"),
+                    "attempt_id": env.get("attempt_id"),
+                    "connection_mode": env.get("connection_mode"),
+                    "params": env.get("params"),
+                    # SPEC.md 9.5: inputs maps step_id -> that step's output.
+                    "input_step_ids": sorted(inputs) if isinstance(inputs, dict) else None,
+                    "input_count": len(inputs) if isinstance(inputs, dict) else None,
+                    # SPEC.md 9.5: present iff connection_mode == "async".
+                    "has_callback_url": "callback_url" in env,
+                    "missing_envelope_fields": sorted(k for k in REQUIRED if k not in env),
+                    "unknown_envelope_fields": sorted(set(env) - KNOWN),
+                }
+                # SPEC.md 9.6, the sync + envelope success shape.
+                self._reply(200, {"status": "success", "output": {"echo": observed}})
+
+            def _reply(self, code, payload):
+                raw = json.dumps(payload).encode("utf-8")
+                self.send_response(code)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, fmt, *args):
+                print("worker: " + (fmt % args), flush=True)
+
+        print("worker: listening on 0.0.0.0:9090", flush=True)
+        ThreadingHTTPServer(("0.0.0.0", 9090), Handler).serve_forever()
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:9090/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+
+volumes:
+  pgdata:

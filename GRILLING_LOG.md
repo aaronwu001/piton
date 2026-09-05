@@ -1283,3 +1283,227 @@ Not done, deliberately: `demos/alpha/` and the migrations. They are the next ste
 file used above was a throwaway precisely so that `demos/alpha/docker-compose.yml` is written once,
 as the real one the suite will reference (§5.5.4). Nothing has been committed — the four modified
 documents plus `go.mod`, `.gitignore` and `cmd/` are all still in the working tree.
+
+---
+
+## Round 20 — Process confirmation (2026-09-02)
+
+| # | Topic | Ruling / outcome |
+|---|---|---|
+| R20-a | **Development order** | Owner asked to confirm that the method is "tests first, then code". Confirmed against `CLAUDE.md § 4`, with the precision the question invited: the order is *ratified SPEC sections → demo script → tests derived from SPEC → implementation → owner's hand-run demo → automated suite*. Three points distinguish it from ordinary TDD and were stated back: (1) the binding constraint is the test's **provenance** (`§ 5.1` — SPEC only; never the implementation, never the old project, never an unratified spoken ruling), not the red/green cycle; (2) the **demo script precedes the tests**, not the other way round; (3) the acceptance evidence is step 5, the owner's manual run — `§ 4` states the suite cannot replace it, and a green suite the owner has never looked behind is not evidence a milestone landed. No rule was changed, nothing was eliminated, no SPEC text touched |
+
+---
+
+## Round 21 — `demos/alpha` walkthrough, and the `owner_id` question closed (2026-09-03)
+
+**State of the tree at the start of this round.** `demos/alpha/` exists with its four files —
+`docker-compose.yml`, `piton.yaml`, `workflow.json`, `demo.sh` — untracked, and this log carries no
+entry for their creation. They are recorded here for the first time. No implementation exists beyond
+`cmd/piton/main.go`'s placeholder, so `demo.sh` cannot pass yet; it is the *demo script* of
+`CLAUDE.md § 4` step 2, written before the code (R20-a).
+
+| # | Topic | Ruling / outcome |
+|---|---|---|
+| R21-a | **`runs.owner_id` on a `DONE` run** | `demo.sh` had displayed the column and deliberately asserted nothing about it, on the reasoning that `SPEC.md § 18.1` states no expectation and `§ 8.7` names claim / heartbeat / release as the only three writers of coordination metadata — none of which is the run reaching `DONE`. Owner ruled: **"a DONE run should have no owner_id"** |
+| R21-b | **What R21-a actually changed** | *Nothing in the rules.* `SPEC.md § 6.2` already carries the invariant — "`owner_id` is non-`NULL` only while `status = 'RUNNING'`". The ruling confirms the invariant rather than adding one. The script was being over-cautious: it treated a ratified invariant as an open question because the *mechanism* producing it was unwritten |
+| R21-c | **`demo.sh` changed accordingly** | Section 6 ("derived from SPEC, beyond 18.1's list") now asserts `owner_id IS NULL`, cited to `§ 6.2`, not to the spoken ruling — `CLAUDE.md § 5.1` permits SPEC as a test's only source. Section 4's display comment and the header block were rewritten to match. `claimed_at` is **not** asserted: `§ 6.2`'s invariant names `owner_id` only, and `§ 14`'s replay clears `owner_id` only, so asserting the pair would be inventing a rule (`CLAUDE.md § 9`) |
+| R21-d | **Open — a proposed `SPEC.md § 8.7` amendment** | The invariant holds but no section says *what writes it*. `§ 8.7`: "exactly three operations may write coordination metadata — claim, heartbeat and release." `§ 14` (replay) and `§ 15` (cancel) each separately state that they clear `owner_id`, so the sentence already has two exceptions living outside it. The `DONE` transition is a third and is written nowhere. **Proposed, not applied** (`CLAUDE.md § 2` rule 1): `§ 8.7` gains the `DONE` transition as a writer of `owner_id = NULL`, and the question of whether `claimed_at` is cleared with it is answered at the same time. Awaiting the owner's ruling; no SPEC text touched |
+| R21-e | **Demo script vs automated suite** | Owner asked whether the tests are not already finished. Distinction restated: `demo.sh` is `CLAUDE.md § 4` step 2 — one happy-path run, the operator's hand-run artefact, its assertions existing so an unattended run has a verdict. The **automated suite** is steps 3 and 6 — Go tests derived from SPEC whose job is to guarantee that what the owner saw by hand *stays* true, governed by `CLAUDE.md § 5.5` (one compose environment per test file, volume wipe between groups, concurrency and fencing tests in their own group, and § 5.5.4's requirement that they reference `demos/alpha/docker-compose.yml` itself). No ruling sought; nothing changed |
+
+---
+
+## Round 22 — The `owner_id` amendment drafted, and a wider gap found (2026-09-03)
+
+| # | Topic | Ruling / outcome |
+|---|---|---|
+| R22-a | **R21-d question 1** | Owner ruled: **yes** — the `DONE` transition clears `owner_id`, and `§ 8.7` says so |
+| R22-b | **R21-d question 2** | Owner ruled: **yes** — `claimed_at` is cleared with it. Reasoning offered and accepted: without an owner, `claimed_at` is a timestamp pointing at a nonexistent claim, and a SPEC that gives three different answers for the same pair in three places guarantees one implementation site gets it wrong |
+| R22-c | **Found while drafting: the ruling cannot stop at `DONE`** | `§ 6.2`'s invariant is *"`owner_id` is non-`NULL` only while `status = 'RUNNING'`"* — it is scoped to the status, not to `DONE`. A run reaching **`DLQ`** (`§ 12.2`, worker-side and planner-side alike) therefore violates the invariant just as a `DONE` run would, and no section clears the pair there either. `CANCELLED` is the only exit already covered, and it covers `owner_id` alone. A `DONE`-only amendment would leave SPEC self-contradictory on the `DLQ` path. The draft is therefore written in the general form — **every transition of a run out of `RUNNING` clears the pair** — which covers `DONE`, `DLQ` and `CANCELLED` in one sentence. This is a widening of what R22-a asked for and is flagged as such; put to the owner |
+| R22-d | **Supporting observation, offered as reasoning not as a rule** | Clearing the pair inside the same transaction that makes a run terminal means the driver that wrote it can never take `§ 8.2`'s ownership fence on that run again — its next `SELECT … WHERE owner_id = :me` returns zero rows and it stops silently, which is what `§ 4.2` step 1 already prescribes. The clearing is thus not merely cosmetic tidying of a coordination column; it is the fence agreeing with the state machine |
+| R22-e | **Status** | Draft written and shown to the owner; **`SPEC.md` not touched** (`CLAUDE.md § 2` rule 1). Five sites are affected: `§ 8.7` (the "exactly three operations" paragraph), `§ 6.2` (the invariant), `§ 14` (replay), `§ 15` (the cancel statement), and one sentence in `§ 4.3`. Awaiting the owner's nod before any edit |
+
+---
+
+## Round 23 — The amendment landed, and alpha's automated suite written (2026-09-03)
+
+| # | Topic | Ruling / outcome |
+|---|---|---|
+| R23-a | **R22-c: the general form** | Owner agreed. `SPEC.md` amended in five places so that the rule is stated once and the sites that used to state fragments of it now point at it |
+| R23-b | **`SPEC.md § 8.7`** | The paragraph "exactly **three** operations may write coordination metadata" is replaced by a four-row table — **claim**, **heartbeat**, **release**, and **any transition of a run out of `RUNNING`** — the fourth clearing `owner_id` and `claimed_at` in the same transaction as the status change. Two `Why:` paragraphs added: (1) a separate tidy-up pass is a rule that must be remembered at every call site, the class of mistake `§ 8.2` already rejects; (2) the driver that writes the terminal status clears its own ownership, so its next fence returns zero rows and it stops silently — the fence and the state machine agree by construction. Cancellation's clearing is no longer described as "belt-and-braces"; it is this rule applied to one of the three exits |
+| R23-c | **`SPEC.md § 6.2`** | Invariant widened to the pair: "`owner_id` and `claimed_at` are non-`NULL` only while `status = 'RUNNING'`, and are always written and cleared as a pair (§8.7)" |
+| R23-d | **`SPEC.md § 14`, `§ 15`, `§ 4.3`** | Replay now clears both, with a note that under the new `§ 8.7` a `DLQ` run already holds both as `NULL` so the sentence is a restatement and not a second mechanism. The cancel statement gains `claimed_at = NULL`. `§ 4.3`'s "changes only on the rare, meaningful events of claim and release" gains "and a run becoming terminal" |
+| R23-e | **`demos/alpha/demo.sh`** | Section 6 now asserts both `owner_id IS NULL` and `claimed_at IS NULL`, cited to `§ 6.2` and `§ 8.7`. The header block that described the question as open is rewritten to describe it as settled |
+| R23-f | **Milestone alpha's automated suite** | Written under `test/alpha/`: a `harness` package (compose lifecycle, `psql` through `docker compose exec`, the HTTP calls of `§ 18.1`, and readers for `piton.yaml` and `workflow.json`), and two groups — `happypath` and `ownership`. `run.sh` runs them with `-p 1` and `-count=1`; `README.md` states what the suite is and is not |
+| R23-g | **Why two groups and not one** | `CLAUDE.md § 5.5.1` makes a group one compose environment, and a Go package is the unit that can own a `TestMain`, so one package is one group. `ownership` is separate for the reason `§ 5.5.3` gives: it asserts **global** coordination state — the whole `orchestrators` table and `runs.owner_id` across every run — and "exactly one orchestrator row" is only meaningful when nothing may start a second one. Go runs packages concurrently by default, so `-p 1` is what makes `§ 5.5.2` real rather than intended |
+| R23-h | **How the suite reaches the database** | Through `docker compose exec postgres psql`, not a Go driver. `demos/alpha/docker-compose.yml` deliberately publishes no host port for Postgres, and `CLAUDE.md § 5.5.4` forbids the suite from defining an environment of its own to obtain one. Cost accepted: one process per query, which this suite's volume does not notice. Benefit: it is the access path `SPEC.md § 17.1` gives the operator, so an assertion can be re-run by hand at a terminal — and `go.mod` still declares no dependencies |
+| R23-i | **Open — does alpha implement `§ 16` validation?** | The suite does **not** assert submission-time validation, and this is flagged rather than silently decided. `§ 16` states its 400s unconditionally, and `§ 11.2`'s "rejected with 400 until milestone eta" only means something if the rejection exists from the first release — but `§ 18`'s milestone table gives *"cancellation and submission-time validation"* to milestone **ι**, and `§ 18.1` neither claims validation for alpha nor lists it among what alpha deliberately omits. Deciding it by writing a test is exactly what `CLAUDE.md § 9` forbids. Put to the owner |
+| R23-j | **State** | `gofmt` clean, `go vet` clean, `go build` clean, `go test -short ./...` green (both groups skip without docker). The full suite fails at `TestMain` because milestone alpha has no implementation yet — the expected state, and the point of `§ 4` step 3 |
+| R23-k | **Found by running the harness, not by reading it** | The first execution left `postgres` and `worker` running after the bring-up failed, because `TestMain` exited without tearing down. A half-started environment holds the published port 8080 and would make the next group — or the owner's hand-run demo — fail for a reason unrelated to what it was testing. `harness.Up` now captures the orchestrator logs into the error **and then** tears the environment down, so diagnosis survives and no residue does. Verified: both groups run, both fail at `TestMain` as expected, and `docker ps -a` lists nothing afterwards |
+
+---
+
+## Round 24 — Claude's analysis of the validation question (input; not itself spec) (2026-09-03)
+
+Owner asked what `§ 16`'s *"400 for a non-empty `overrides`"* concretely is, and what he has to
+decide. No ruling was made in this round; nothing in `SPEC.md` was touched.
+
+| # | Topic | Finding |
+|---|---|---|
+| R24-a | **What the rule is about** | The configuration-layering feature of `§ 11`. `§ 11.1` defines five workflow-level knobs; `§ 11.2` defines three levels at which they may be set — workflow (implemented), run (`overrides` in the run-creation body), step (`timeout_seconds` / `max_attempts` in a StepSpec). The last two land at milestone **η**. Until then the request *shape* exists and any value in it is a 400: `§ 10.1`'s reason is that the shape of a request is a contract others build against, so adding a sub-object later would be a format change while rejecting a value inside an existing sub-object is not. `runs` has no `overrides` column and `steps` has no override columns until η (`§ 11.2`), so a value could not be honoured even if it were accepted — and `§ 11.2`'s "a rejection is a 400, never silence" is `§ 16`'s governing principle applied to exactly that case |
+| R24-b | **R23-i is narrower than stated** | `§ 6.1` — which R23-i did not cite — already settles the largest part of it: *"Every element of `planner_static_steps` is a StepSpec, and is validated as one — by §9.4 and §9.8 — at `POST /workflows`, before any run exists"*, with a correctness argument, not a preference: a malformed static plan discovered at run time leaves a run that "cannot progress and cannot fail … it would sit `RUNNING` forever, reclaimed and re-failed by every sweep. Validating at submission makes that state unreachable." Alpha uses the static planner, so alpha cannot defer this without making a state `SPEC.md` declares unreachable reachable. R23-i's framing — "does alpha validate at all?" — was too wide |
+| R24-c | **What is actually left to decide** | Given R24-b forces a full StepSpec validator into alpha, the open question is only whether the *rest* of `§ 16`'s list (planner_type typos, unknown keys, wrong JSON types, the `≥ 1` ranges, and the run-level rules — non-empty `overrides`, missing `input`, unknown key) also lands in alpha, or waits for **ι**. Recommendation put to the owner: land the whole of `§ 16` in alpha, because the expensive piece is already forced and the remainder is a handful of checks on the same parse, several of which are `§ 6.1`'s own column invariants. `§ 18` calls milestones demo scenarios, not layers, so ι keeps its meaning — it *demonstrates* validation rather than introducing it |
+| R24-d | **A second, smaller undefined case** | `§ 16` makes a **missing `input`** a 400 but says nothing about a missing or `null` `overrides`; `§ 10.1` shows both keys present. Nothing today depends on it — `demo.sh` and the suite both send `"overrides":{}` explicitly — but it is a wire-contract question and therefore fails `CLAUDE.md § 3`'s "would adding this later be awkward?" test. Put to the owner alongside R24-c |
+
+---
+
+## Round 25 — Rulings (2026-09-03)
+
+| # | Topic | Ruling / outcome |
+|---|---|---|
+| R25-a | **R24-c, in part** | Owner ruled: **alpha implements the complete StepSpec validation for the static planner** — `§ 9.4`'s required fields and types, and all six rules of `§ 9.8`, applied to every element of `planner_static_steps` at `POST /workflows`. This is `§ 16` rule 3, and it discharges `§ 6.1`'s correctness requirement that a malformed static plan can never reach a driver |
+| R25-b | **R24-d, confirmed** | Owner's reading — *"`overrides` is accepted empty, or absent, and anything else is an error"* — was put back and **confirmed as the literal reading of `§ 16`**, not merely a plausible one: `§ 16` enumerates a **missing `input`** as a 400 and pointedly does not enumerate a missing `overrides`, so absence is already legal and needs no new rule. `{}` is the only accepted value; any populated object is a 400 (`§ 11.2`) |
+| R25-c | **The one case the reading does not cover** | `"overrides": null` — present, but not an object. Recommendation put to the owner: **accept it as empty**, because the same feature at the *step* level already answers the same question in that direction — `§ 9.4` gives `timeout_seconds` / `max_attempts` the default `null` and permits omission, and `§ 9.8` rule 5 rejects only a **non-`null`** value. A run level that rejected `null` while the step level accepts it would have the two halves of one feature disagree about the same JSON value. Awaiting ruling |
+| R25-d | **Still open from R24-c** | Whether `§ 16` rules **1, 2, 4, 5 and 6** (planner_type not in the enum; `planner_url` missing or not an absolute HTTP(S) URL; any unknown top-level key; any configuration field of the wrong JSON type; any `*_max_attempts` or `*_timeout_seconds` below 1, or a negative `step_retry_delay_seconds`) and the run-level *unknown key* rule also land in alpha, or wait for **ι**. R25-a settled rule 3 only. Recommendation unchanged: land them, because the expensive validator is now forced anyway and rule 6 is `§ 6.1`'s own column invariants |
+
+---
+
+## Round 26 — Validation ruled into alpha, and the third test group written (2026-09-03)
+
+| # | Topic | Ruling / outcome |
+|---|---|---|
+| R26-a | **R25-c** | Owner ruled: **`"overrides": null` counts as absent.** So `{}`, `null` and omission all mean "no overrides", and only a populated object is a 400 |
+| R26-b | **R25-d** | Owner ruled: **all of `§ 16` lands in alpha.** Rules 1, 2, 4, 5 and 6 join rule 3, together with the run-level rules |
+| R26-c | **Transcription directed** | Owner directed a *short* note in `SPEC.md` and said the tests follow. Two edits, both brief, both applied: `§ 16` gains one sentence — "`overrides` may be `{}`, `null`, or omitted; all three mean 'no overrides'" — with a one-paragraph `Why:` grounding it in `§ 9.4`'s step-level default and `§ 9.8` rule 5's refusal of only a **non-`null`** value, so the two halves of one feature cannot disagree about the same JSON value. `§ 18.1` gains a "**Which validation α implements**" paragraph beside the existing "Which endpoints α implements": all of `§ 16`, and `§ 9.4` / `§ 9.8` in full for every element of `planner_static_steps`, with the `Why:` that `§ 6.1` forces the validator into alpha regardless and that **ι demonstrates validation, it does not introduce it** — consistent with `§ 18`'s own "milestones are demo scenarios, not layers" |
+| R26-d | **Third test group** | `test/alpha/validation/` written: `§ 16`'s six workflow rules, `§ 9.8`'s six StepSpec rules against `planner_static_steps[0]`, and the run-creation rules including all three accepted shapes of `overrides`. It starts no run, so it is much the fastest group. `harness.WorkflowJSON` added so every rejected body is `demos/alpha/workflow.json` with **one** mutation — a hand-written invalid document could be invalid for three reasons at once and still produce the 400 the test wanted |
+| R26-e | **Positive control** | `TestMain` creates the demo's own workflow before any rejection is asserted, and fails the group if it is refused. Without it every "must be 400" assertion would pass against an orchestrator that rejected everything |
+| R26-f | **One thing deliberately not asserted** | `§ 10.5` requires a rejection to carry "the identifier and current status of every entity the request named or would have touched", but says in the same breath that a `POST /workflows` rejection has no run to describe, and `workflows` has no status column at all (`§ 6.1`). What a workflow-level rejection must carry beyond `error` and `message` is therefore not settled, and only those two are asserted. Flagged in the test's own comment rather than guessed (`CLAUDE.md § 9`) |
+| R26-g | **State** | `gofmt` clean, `go vet` clean, `go test -short ./...` green across all three groups. The validation group runs, fails at `TestMain` because alpha has no implementation, and leaves no containers behind. `test/alpha/README.md` updated: the group table gains its third row, and the old "this suite does not cover validation" section is replaced by why validation is asserted here rather than at ι |
+
+---
+
+## Round 27 — Milestone α implemented (2026-09-03)
+
+Owner directed: *"implement stage alpha to meet the tests in `test/alpha`"*, with `SPEC.md` and
+`test/` explicitly out of bounds. Neither was touched; `git status` confirms both carry only the
+modifications that predated this round.
+
+### What was built
+
+| Package | Contents |
+|---|---|
+| `internal/config` | The one YAML file of `§ 4.4`, read with unknown keys refused |
+| `internal/model` | The entities of `§ 3.2`, the enumerations of `§ 5`, `§ 6.4`'s 4 KB truncation, UUID minting |
+| `internal/validate` | `§ 16` in full, and `§ 9.4` / `§ 9.8` for every StepSpec |
+| `internal/storage` | The interface `§ 7` makes a conformance requirement — opaque `[]byte` for every JSON document |
+| `internal/storage/postgres` | The only implementation, plus the embedded migration that is `§ 6` and `§ 7.2` |
+| `internal/planner` | `§ 6.1`'s built-in static planner |
+| `internal/dispatch` | `§ 9.5`'s envelope and `§ 9.6`'s reply |
+| `internal/engine` | `§ 8.6`'s sweep, `§ 8.7`'s heartbeat and release, `§ 4.2`'s driving loop |
+| `internal/httpapi` | Exactly the five endpoints `§ 18.1` gives α, and `§ 10.5`'s error shape |
+| `cmd/piton` | The boot order `§ 13.1` case 5 and `§ 18.1` fix between them |
+
+### Rulings not needed, decisions taken, and one tension found
+
+| # | Topic | Outcome |
+|---|---|---|
+| R27-a | **The storage interface is a method per fenced operation, not an exposed transaction** | Every write that constitutes a decision is one method, each opening with `§ 8.2`'s fence and committing as a unit. Handing a transaction handle to the caller instead would move the fence obligation to the call site, which is the mistake `§ 8.2` names: *"one forgotten statement silently breaks the whole guarantee"* |
+| R27-b | **Schema constraints carry the invariants, not the caller** | `§ 6.4` asks for exactly this for `attempts` — *"enforced by the backend rather than by the caller"* — and the same reasoning was applied to `§ 6.2`'s and `§ 6.3`'s invariants. `runs` therefore carries a CHECK that `owner_id`/`claimed_at` are a pair and are non-`NULL` only while `RUNNING`, so a forgotten fourth writer (`§ 8.7`) fails loudly instead of leaving the column silently lying |
+| R27-c | **A tension between `§ 4.2` and `§ 6.3` over when `steps.attempt_count` is incremented — flagged, not resolved** | `§ 4.2` says dispatch *"insert an `attempts` row …, increment `steps.attempt_count`, **commit**, and only then send the HTTP request"* — the increment is at dispatch. `§ 6.3` says `attempt_count` is *"**Not** the number of `attempts` rows"* and gives as the reason that a cancelled attempt does not burn budget, *"so the two numbers legitimately differ"* — which is only true if the increment happens at **outcome**, excluding `cancelled`. Under increment-at-dispatch the two numbers can never differ. Both readings satisfy every α assertion identically (`attempt_count = 1` on a step with one successful attempt), so the milestone did not turn on it. **`§ 4.2` was followed**, because it is a mechanical procedure and `§ 6.3`'s line is a rationale, and because a budget counted at dispatch can never be under-counted by a crash between the dispatch and its outcome. This becomes decidable at **γ** and load-bearing at **ι**, where cancellation exists. Put to the owner |
+| R27-d | **`raw` and `async` dispatch: what an unbuilt mode does at run time** | `§ 9.8` does not reject either — `sync`+`raw` is legal (θ) and `async`+`envelope` is legal (ε), and `§ 19.3` keeps both designed in and unbuilt — so a workflow declaring one is accepted by `§ 16` and can produce a run. Rather than add a submission-time rejection `§ 9.8` does not have (which would also have made `TestRejectsAsyncRaw` and `TestRejectsInputFromInRawMode` pass for the wrong reason), the **dispatcher reports one failed attempt** naming the mode and its milestone. It burns budget, converges to DLQ under `§ 12.2` rather than sitting `RUNNING` forever, and the reason is legible in `attempts.error_text` (`§ 17.3`). One uniform rule, and a five-line deletion when θ and ε land. **This is a decision, not a SPEC rule** |
+| R27-e | **`planner_type: "http"` — the same shape of hole, the same answer** | `§ 16` rule 1 accepts `http` as an enumerated value, and the HTTP planner is ζ (`§ 19.3`). A run against one records a planner call that could not be made (`planner_unreachable`, `§ 6.5`), which burns planner budget and reaches planner-side DLQ under `§ 12.2`. Routed through the normal budget path with no special case, because `§ 12.1` forbids exempting any planner from it |
+| R27-f | **`§ 4.2`'s retry and worker-side DLQ are implemented although γ demonstrates them** | Same argument the owner accepted in R26-b for `§ 16` and ι: `§ 18` makes milestones demo scenarios, not layers, and the budget check is part of the driving loop itself. Without it a single failed attempt would leave a run that can neither progress nor fail — the state `§ 6.1` calls unreachable |
+| R27-g | **`§ 10.5` at workflow level** | Only `error` and `message` are sent for a `POST /workflows` rejection, which is R26-f's finding applied to the implementation rather than a new decision: there is no run to describe, `workflows` has no status column (`§ 6.1`), and the workflow was never created |
+| R27-h | **`input` must be a JSON object** | `§ 16` makes a missing `input` a 400 and says nothing about its type. `§ 9.2` types `workflow_input` — which is `runs.input` verbatim — as an object, so a non-object is refused under `§ 16` rule 5's principle. Recorded because it is a wire-contract judgement, though no test turns on it |
+| R27-i | **One configuration rule with no SPEC behind it** | `config.Load` refuses a `lease_ttl_seconds` at or below `heartbeat_interval_seconds`. `§ 8.7` derives liveness from the two together and says 30 s over 10 s *"tolerates two missed heartbeats"*; a TTL at or below the interval tolerates none, so a live orchestrator would be declared dead by its own scheduling jitter. This governs a file the operator writes by hand, not the wire, so it is an implementation guard rather than a proposed SPEC rule |
+| R27-j | **Dependencies** | `go.mod` previously declared none. Three were added: `gopkg.in/yaml.v3` (`§ 9.1` puts configuration in YAML), `github.com/lib/pq`, and `github.com/golang-migrate/migrate/v4` — the last because `CLAUDE.md § 8` names it in the stack. Migrations are embedded with `go:embed` and applied at boot, since `§ 18.1`'s environment has exactly three services and therefore no migration container |
+| R27-k | **Found by running, not by reading** | `lib/pq` binds a `[]byte` parameter as `bytea`, so a JSON document passed as bytes reaches a `jsonb` column as the hex text `\x7b…` and is rejected. Every JSON parameter is therefore bound through one helper that converts to `string`. The interface above it still deals only in bytes, as `§ 7.1` requires — this is the backend's encoding choice, which is precisely what `§ 7.1` leaves to it |
+| R27-l | **Result** | `demos/alpha/demo.sh`: **35 assertions, 0 failures**, run end to end. `test/alpha/run.sh`: all three groups green — `happypath` 12 tests, `ownership` 5, `validation` 17 — each against its own `docker compose` environment, torn down with the volume wipe between groups. `gofmt`, `go vet` and `go build` clean; `go test -short ./...` green with no docker. No container was left behind |
+| R27-m | **What is still outstanding** | `CLAUDE.md § 4` **step 5**. The owner has not yet run the demo by hand and inspected database truth from a terminal, and a green suite he has never looked behind is not evidence the milestone landed |
+
+---
+
+## Round 28 — R27's four questions ruled, and the cancellation clause examined (2026-09-03)
+
+| # | Topic | Ruling / outcome |
+|---|---|---|
+| R28-a | **R27-c** | Owner ruled: **`§ 4.2` is correct** — `steps.attempt_count` is incremented at **dispatch**. The implementation already did this, so no code changed. What did change is what the counter *means*, and that has consequences two sentences of `SPEC.md` do not survive — see R28-e |
+| R28-b | **R27-d** | Owner ruled: **keep `raw` and `async` open.** No submission-time rejection is added; `§ 9.8` stands as written, and an unbuilt mode is reported as one failed attempt naming its milestone |
+| R28-c | **R27-e** | Owner ruled: confirmed. `planner_type: "http"` stays accepted at `POST /workflows` and converges to planner-side DLQ at run time |
+| R28-d | **R27-f** | Owner ruled: confirmed. `§ 4.2`'s retry and worker-side DLQ stay in α |
+
+### R28-e · The owner's question: *when is an attempt cancelled?*
+
+Asked so that *"a cancelled attempt does not burn budget"* can be designed rather than assumed.
+The answer is narrow, and it exposes two sentences that R28-a has just made false.
+
+**There is exactly one circumstance, and it is milestone ι.** `failure_reason = 'cancelled'` is
+written only by `§ 15`'s cancel transaction, and only when it lands on combination **L2** — all
+three of these true at the same instant:
+
+1. the operator posts `POST /runs/{run_id}/cancel`;
+2. `runs.status` is `RUNNING` or `DLQ` (anything else is a 409, `§ 15`);
+3. the derived `last_step` is `RUNNING` **and** that step has a `RUNNING` attempt.
+
+If the run is in `DLQ`, or its last step is `DONE` or `DLQ`, no attempt is touched at all — those are
+`§ 5.5`'s L7 and L8, and `§ 5.7` says the last step "keeps the terminal state it already had".
+
+**Nothing else produces the value.** Verified against the implementation and re-derived from SPEC:
+a passed deadline gives `timeout` or `orphaned` (`§ 5.3`); a retry cannot supersede a live attempt,
+because `§ 8.3`'s CAS moves the previous one out of `RUNNING` before a new row is inserted; an
+orchestrator's clean shutdown releases ownership only (`§ 8.7`) and leaves the attempt `RUNNING` to
+be expired later as `timeout`/`orphaned`; a worker's own failure report gives `worker_error`; and
+replay does not touch `attempts` rows at all (`§ 14`).
+
+| # | Consequence of R28-a | Status |
+|---|---|---|
+| R28-f | **`§ 5.7` survives verbatim** | Its sentence is *"attempt → `FAILED(cancelled)` with `attempt_count` **unchanged**"*, and its `Why:` is *"cancellation is not the worker's failure … incrementing it would put a misleading number in front of the operator"*. Both are statements about what the **cancel transaction** writes, and under `§ 4.2` it writes no counter. Nothing to amend |
+| R28-g | **`§ 5.3`'s table note is now false** | *"Every value below burns one unit of budget except `cancelled`"* was true only under the outcome-time reading R28-a rejected. Under `§ 4.2` the budget is burned by **dispatching**, so a cancelled attempt burned one unit when it was dispatched, exactly like every other attempt — and no `failure_reason` affects the counter, because the counter is not written at outcome time at all. **Amendment proposed, not made** (`CLAUDE.md § 2` rule 1) |
+| R28-h | **`§ 6.3`'s `Why:` is now false, but its rule is not** | The rule — *"`attempt_count` is stored rather than derived as `COUNT(attempts)`"* — is right. Its stated reason — *"a cancelled attempt does not burn budget, so the two numbers legitimately differ"* — cannot hold under `§ 4.2`, where the two numbers are always equal within a round. **A stronger reason exists and needs no cancellation: replay.** `§ 14` resets `steps.attempt_count` to 0 while the `attempts` rows survive — they must survive, or `§ 6.2`'s `replay_count` would have nothing to bucket and its own `Why:` ("the owner must be able to see which round a given attempt belonged to") would be unsatisfiable. After one replay round a step can show `count(attempts) = 3` and `attempt_count = 0`. **Amendment proposed, not made** |
+| R28-i | **What `attempt_count` now means, stated once** | *The number of attempts **dispatched** for this step in the **current replay round**.* Written in exactly one place — the dispatch transaction of `§ 4.2` — and read in exactly one place, `§ 12.2`'s budget check. `§ 4.2` already accepts the cost this implies: *"if the process dies between the two, the worst case is an attempt that was never dispatched and will time out"* — budget burned for work never done, accepted deliberately |
+
+### R28-j · Failure paths exercised by hand, since nothing in α's suite reaches them
+
+Four probes run against `demos/alpha/docker-compose.yml`, then torn down. None is a new artefact;
+they are recorded because they are the first evidence these code paths run at all.
+
+| Probe | Result |
+|---|---|
+| **Worker-side DLQ** — `worker_url` at a dead port, `step_max_attempts = 3` | 3 attempts, all `FAILED(transport_error)`; step `DLQ` with `attempt_count = 3`; run `DLQ`; `owner_id`/`claimed_at` `NULL`; one `dead_letter_queue` row, `worker_budget_exhausted`, `attempt_count = 3`, `step_id` present. Combination **L4** |
+| **`raw` dispatch (θ, unbuilt)** — accepted by `§ 16`, as R28-b requires | 2 attempts, both `FAILED(transport_error)` with `error_text` naming `dispatch_style "raw"` and its milestone; run converges to `DLQ` rather than hanging |
+| **`http` planner (ζ, unbuilt)** | `planner_attempt_count` reaches its budget of 2; `last_planner_error` names the milestone; run `DLQ` with **zero steps**; one `dead_letter_queue` row, `planner_unreachable`, `step_id` **NULL**. Combination **L5**, and the planner-side/worker-side split of `§ 12.3` visible in one column |
+| **`SIGKILL` mid-attempt, then restart** — `worker_url` at an unroutable address so the attempt stays `RUNNING` | Ownership survived the kill (no clean shutdown, so no release, `§ 8.7`); `orchestrators` shows two rows, the dead one not live; after `lease_ttl` the new process claimed the run (`§ 8.5`) and expired the sync attempt **at claim time** (`§ 8.6`) with `failure_reason = 'orphaned'` — `§ 5.3`'s definition, *"timeout, where the attempt's dispatching orchestrator was not live"*, decided in SQL against the same predicate the claim uses. Attempt 2 was then dispatched by the new orchestrator, `attempt_count = 2`. This is machinery **β** will demonstrate; it is not a claim that β has landed |
+
+| # | Topic | Outcome |
+|---|---|---|
+| R28-k | **Two amendments awaiting a ruling** | `§ 5.3`'s "except `cancelled`" clause (R28-g) and `§ 6.3`'s `Why:` (R28-h). Both are consequences of R28-a, neither changes any behaviour, and `SPEC.md` has **not** been touched |
+| R28-l | **Still outstanding** | `CLAUDE.md § 4` **step 5** — the owner's own hand-run of `demos/alpha/demo.sh` |
+
+---
+
+## Round 29 — Cancellation zeroes the budget; the §4.2 ruling transcribed (2026-09-03)
+
+| # | Topic | Ruling / outcome |
+|---|---|---|
+| R29-a | **Cancellation and `attempt_count`** | Owner ruled: **a cancel sets the step's `attempt_count` to 0.** Reasoning given: if a run is cancelled the whole thing is over, so the number is not worth a rule. He explicitly did not want time spent on it. Accepted, and it is the simpler rule — see R29-c |
+| R29-b | **One correction to the reasoning offered, before it went into SPEC** | The owner's stated ground was *"restart makes it 0 anyway"*. That is not true and could not be written into an authority document: a **restart** deliberately does **not** reset the counter — `§ 6.2` and `§ 12.2` exist precisely so it survives a crash, or a crash loop would never converge. What is true, and what the `Why:` now says, is that the number is **never read again**: `CANCELLED` is terminal (`§ 5.1`) and `§ 14` replays only a run that is in `DLQ`, so no budget check can ever consult it |
+| R29-c | **The ruling rescues `§ 6.3`** | R28-h had found `§ 6.3`'s `Why:` false under R28-a — with the increment at dispatch, `COUNT(attempts)` and `attempt_count` can never differ within a round. Zeroing on cancel makes them differ again (three attempt rows, `attempt_count = 0`), so the original rationale holds, now stated over both of the two things that reset the counter — cancellation (`§ 5.7`) and replay (`§ 14`) |
+
+### R29-d · The transcription — five sites, all directed by R28-a and R29-a
+
+`CLAUDE.md § 2` rule 1 permits this: the owner directed that his rulings be written into `SPEC.md`.
+
+| Site | Change |
+|---|---|
+| **`§ 5.7`** | *"with `attempt_count` **unchanged**"* → *"and that step's `attempt_count` is **set to 0**"*. The `Why:` is rewritten on R29-b's ground, and a second `Why:` is added answering the obvious objection — this is not a refund of `§ 4.2`'s dispatch-time budget; the attempt rows and their `failure_reason` stay, and only the counter that would govern a future dispatch is cleared, of which there is none |
+| **`§ 5.3`, lead sentence** | *"Every value below burns one unit of budget except `cancelled`"* was false under R28-a. Replaced by: no `failure_reason` changes `steps.attempt_count`, because `§ 4.2` burns budget at **dispatch**, not at the outcome; `cancelled` is the exception in the other direction, zeroing it |
+| **`§ 5.3`, `cancelled` row** | *"**Does not burn budget**"* → *"**The step's `attempt_count` is zeroed** (§5.7)"* |
+| **`§ 6.3`** | `Why:` restated over cancellation **and** replay, both of which reset the counter while leaving the `attempts` rows in place |
+| **`§ 15`** | The SQL sketch's comment now names the zeroing, since that sketch is what an implementer copies |
+
+| # | Topic | Outcome |
+|---|---|---|
+| R29-e | **A sixth site found while transcribing, and corrected** | `§ 12.2`'s budget diagram still read *"attempt fails → `steps.attempt_count += 1`"* — a direct contradiction of the `§ 4.2` reading the owner had just ratified in R28-a, and the original source of R27-c. Corrected to `attempt dispatched → += 1`, with the failure line reduced to the budget check it actually is. The paragraph beneath — *"every failure … increments a persisted counter"* — was reworded to *"every dispatch increments a persisted counter **before the work begins**"*, which is both accurate and a **stronger** claim: the counter moves before the crash can happen rather than after. One sentence was added noting that the two counters are incremented at different moments on purpose — a worker attempt has a dispatch to hang the increment on, a planner call has no row and no step, so its failure is the only event there is. Flagged to the owner as a site he did not name |
+| R29-f | **No code changed** | Cancellation is milestone **ι** and no line of it is written. The schema needs nothing either: `steps_attempt_count CHECK (attempt_count >= 0)` already admits 0. The `§ 12.2` correction describes what `internal/storage/postgres/driver.go` already does |
+| R29-g | **Owner's second point: where step detail is read** | Owner ruled `GET /runs/{run_id}/steps` is where step internals are inspected. `decision` therefore stays in that response. `GET /runs/{run_id}` keeps the lighter summary. Noted back to him, unresolved by SPEC and not invented: α exposes no step **output content** over HTTP, only `output_bytes` — `§ 18.1` puts `GET /steps/{step_id}/output` in **ζ**, so output is read from the database, which is what `§ 17.1` makes the interface |
+| R29-h | **Owner asked whether manual testing needs a file of its own** | Answered: **no new file recommended.** Three of the four suggested exercises are already carried by files that exist — `demos/alpha/demo.sh`'s header, `demos/alpha/workflow.json`, and the commented echo worker inside `demos/alpha/docker-compose.yml`. The fourth — the failure-path probes of R28-j — is **γ**'s and **β**'s material, and `SPEC.md § 4.4` already says where it belongs: *"each milestone or demo scenario owns one directory containing one `docker-compose.yml` and one hand-run demo script"*. Writing it now would be writing γ's demo early, which fails `CLAUDE.md § 3`'s admission test, and would add a fifth voice to `CLAUDE.md § 1`'s document set. R28-j's table stands as the record that those paths were exercised; it is explanatory only and is authority for nothing |
+| R29-i | **Still outstanding** | `CLAUDE.md § 4` **step 5** — the owner's own hand-run of `demos/alpha/demo.sh` |
