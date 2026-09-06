@@ -1,0 +1,31 @@
+# Milestone beta - the configuration that must NOT boot.
+#
+# SPEC.md 13.1.5 guarantees one startup behaviour: "storage unreachable at
+# startup. Fail fast: non-zero exit, and an error message that names storage as
+# the cause."
+#
+# That is the only one of SPEC.md 13.1's six situations that is about starting
+# rather than about running, and it is unobservable with a working DSN. This
+# file supplies a broken one so the guarantee can be RUN:
+#
+#   docker compose run --rm --no-deps orchestrator --config /etc/piton/piton-badstorage.yaml
+#
+# and the operator sees a non-zero exit and a message that says "storage",
+# rather than a hang, a panic, or a process that starts and serves traffic it
+# cannot honour.
+#
+# The host name is deliberately one that cannot resolve, rather than a closed
+# port on a host that does exist. A refused connection and an unresolvable name
+# are different failures, and the weaker of the two - a name that resolves to
+# nothing - is the one that most often produces a hang instead of an exit.
+
+storage:
+  backend: postgres
+  dsn: "postgres://piton:piton@no-such-database-host.invalid:5432/piton?sslmode=disable&connect_timeout=3"
+
+http:
+  listen_address: "0.0.0.0:8080"
+
+sweep_interval_seconds: 2
+heartbeat_interval_seconds: 2
+lease_ttl_seconds: 6

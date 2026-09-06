@@ -1,0 +1,54 @@
+# Milestone beta - the orchestrator's boot configuration.
+#
+# SPEC.md 4.4: "The orchestrator reads one YAML configuration file at boot. It
+# declares at minimum the storage backend and its connection details, the HTTP
+# listen address, the sweep interval, the heartbeat interval and the lease TTL."
+#
+# The key names are this demo's choice, not a ratified rule - see the header of
+# demos/alpha/piton.yaml, which explains the two conventions they follow.
+
+storage:
+  backend: postgres
+  dsn: "postgres://piton:piton@postgres:5432/piton?sslmode=disable"
+
+http:
+  listen_address: "0.0.0.0:8080"
+
+# ---------------------------------------------------------------------------
+# THE THREE NUMBERS, AND WHY BETA DOES NOT USE THEIR DEFAULTS
+# ---------------------------------------------------------------------------
+#
+# alpha and gamma run at SPEC.md's defaults: sweep 5 s, heartbeat 10 s, lease
+# TTL 30 s (SPEC.md 8.6, 8.7). Beta runs faster, and the reason is demo latency
+# and nothing else.
+#
+# SPEC.md 8.5's claim can only take a run away from an orchestrator that is not
+# live, and SPEC.md 8.7 defines live as `last_seen_at > now() - lease_ttl`. So
+# after the operator kills the orchestrator, NOTHING can happen until the dead
+# process's lease expires. At the default TTL that is a 30-second pause in the
+# middle of every leg, times five legs, for a property the numbers themselves
+# have nothing to do with.
+#
+# These values change how LONG failover takes. They do not change what recovery
+# does, which is what beta demonstrates. SPEC.md 4.4 makes all three
+# configuration rather than constants precisely so a deployment may choose;
+# choosing here is using the contract, not bending it.
+#
+# The relationship SPEC.md 8.7 states is preserved: the lease tolerates two
+# missed heartbeats before another orchestrator may take over (2 s heartbeat,
+# 6 s TTL - the same 3x ratio as the 10 s / 30 s defaults).
+#
+#   sweep_interval_seconds     SPEC.md 8.6. Also the width of SPEC.md 13.3's
+#                              uncertainty window: an attempt with no live owner
+#                              is declared failed somewhere in
+#                              [deadline, deadline + sweep_interval]
+#   heartbeat_interval_seconds SPEC.md 8.7
+#   lease_ttl_seconds          SPEC.md 8.7. An orchestrator is live iff
+#                              last_seen_at > now() - lease_ttl
+#
+# demo.sh and the automated suite both read lease_ttl_seconds out of this file
+# to decide how long to wait for a takeover, so these values and the assertions
+# that depend on them cannot drift apart.
+sweep_interval_seconds: 2
+heartbeat_interval_seconds: 2
+lease_ttl_seconds: 6
